@@ -1,0 +1,191 @@
+# 犀牛派 两轮差速电机驱动参数
+# 加载: python3 ~/motor_driver.py --ros-args --params-file ~/motor_params.yaml
+#
+# ⚠️ GPIO 行号必须在犀牛派上先验证:
+#   sudo apt install gpiod; gpiodetect; gpioinfo gpiochip0
+#   确认排针上 GPIO_XX 对应 (chip, line) 后,再据此修改下方 *line / gpiochip。
+#   默认按 3.3V 40-Pin 排针布局:
+#     ENC_L_A=pin7(GPIO_00)  ENC_L_B=pin8(GPIO_12)
+#     ENC_R_A=pin11(GPIO_05) ENC_R_B=pin10(GPIO_01)
+#     PWM_L=pin32(GPIO_91)   INA_L=pin18(GPIO_61)   INB_L=pin31(GPIO_62)
+#     PWM_R=pin36(GPIO_63)   INA_R=pin37(GPIO_60)   INB_R=pin33(GPIO_124)
+
+motor_driver:
+  ros__parameters:
+    # ── 几何 / 标定 ──
+    wheel_base: 0.20            # m, 两轮中心距
+    counts_per_meter: 11752.0   # = cpr×减速比×4/(π×轮径); 现场推车标定后覆盖
+    # 置 true = 该侧 INA/INB 互换 → 物理转向取反。只有这一处决定轮的转向。
+    # 2026-09-15 实测:两轮一起翻才修好「整体镜像」(前进→后退 + 右转→左转)。
+    # 注意单独交换左右通道只会反转「转向」、不影响前后 —— 那修不好镜像。
+    flip_left: false
+    flip_right: true
+    # 左右通道交叉:true = 通道 L 的 H 桥实际接的是**右**轮。只反转「转向」,
+    # 前进/后退不受影响(和 flip_* 正相反,见 motor_control.map_channels)。
+    #
+    # 2026-09-15 实测定案,别再翻:
+    #   **通道 L(GPIO 91/61/62,即文档里的 PWMA/IN1/IN2)物理上驱动的是右轮**,
+    #   与 motor_wiring.md 的原始设计(PWMA=左电机)相反 —— 接线与文档不一致。
+    #   判据:置 false 后实际驾驶,前进后退正常但**左右转整体反向**;置 true 后
+    #   转向正确。转向只能由本开关修正,翻 flip_* 修不回来(见下方说明)。
+    #
+    # ⚠️ 因为通道被交叉,`flip_left`/`flip_right` 名字与物理轮是**反的**:
+    #   flip_left  → 实际作用于**右**轮
+    #   flip_right → 实际作用于**左**轮
+    #   按名字去调会调错轮子。要改某个轮的极性,先对照 swap_lr 折算。
+    swap_lr: true
+    enc_sign_left: 1.0          # 左编码器计数方向反时置 -1
+    enc_sign_right: 1.0         # 右编码器计数方向反时置 -1
+
+    # ── PID ──
+    pid_kp: 1.0                 # 比例 (duty per m/s 误差)
+    pid_ki: 0.5
+    pid_kd: 0.05
+    pid_ff: 1.0                 # 前馈系数
+    pid_i_limit: 0.3            # 积分限幅 (duty)
+    pid_deadband: 0.05          # 低于此占空比不输出
+    max_duty: 0.9               # 占空比上限
+    # 占空比变化率限制 (防电流尖峰)。**这一条直接决定「手感延迟」**:
+    # 从静止爬到 max_duty(0.9) 的耗时 = max_duty / max_dduty_per_s。
+    #   2.0  → 450ms,实测摇杆到轮子响应 ~300ms,用户反馈「延迟好高」
+    #   10.0 → 90ms,兼顾响应与电流尖峰
+    # 再往上调会更跟手,但换向/堵转时的电流冲击也更大。换向另有专门的
+    # 降 duty 保护(motor_driver._control_tick),不受这里影响。
+    # ⚠️ 只对 motor_driver 那条 ROS 路径有效。直连通道(pwm_proc.py)按设计
+    #    **不做任何限幅**,duty 严格等于摇杆比值 —— 见下方 pwm_cmd_hz 段。
+    max_dduty_per_s: 10.0
+
+    # ── PWM ──
+    pwm_freq: 1000.0            # Hz (软 PWM; 啸叫明显可降 500)
+
+    # ── 直连 PWM 进程 (pwm_proc.py) 专用 ──
+    # motor_driver 不声明也不读这几个键(ROS 只取它声明过的),只给 pwm_proc。
+    # 放在同一份文件里,是为了让「一条摇杆链路的所有参数」集中在一处。
+    pwm_udp_port: 5813          # 摇杆 UDP 监听口(5811/5812 已被 cam_stream/fire_detect 占)
+    pwm_cmd_hz: 200.0           # duty 更新率;软 PWM 周期才 1ms,200Hz 已足够跟手
+    # 超过这么久没收到摇杆包 → duty 0(本进程的本地急停)。
+    # ⚠️ **跳闸 300ms,恢复要连续 600ms(= 2×300)** —— 有滞回,见
+    #    motor_control.Deadman。恢复侧必须严格大于跳闸侧,否则挡不住 chattering:
+    #    2026-09-15 实测,浏览器把**后台标签页**的 setInterval 钳到约 1Hz(包间隔
+    #    ~400ms,恰好在 300ms 两侧来回跨),裸阈值实现会「来一包就恢复、300ms 后
+    #    又跳闸」反复不停 —— 那天日志里 61 次严格交替的「中断/恢复」。舵机与电机
+    #    走同一个门,于是舵机跟着 park↔全速回中,**看起来就是舵机来回抖**。
+    #    滞回之后:包间隔 > 300ms 的链路跳闸一次就**永远恢复不了**(单个 fresh
+    #    窗口最多 300ms,攒不够 600ms),机械上不可能再抖。
+    # ⚠️ 由此浮现一个**隐含前提**:前端包率必须远高于 1/trip。后台标签页的 1Hz
+    #    是**低于设计下限**的,不能当正常工况 —— 所以前端在页面不可见时会**停发**
+    #    (见 slam_viz.py 的 setDriveRunning),而不是硬扛。joy_inject.py 里
+    #    `--hz <= 3.3 直接退出` 的守卫是同一个前提的另一处体现。
+    # ⚠️ 代价:进程刚起来有 600ms 对摇杆没反应(stale 初值为真)。可以接受 ——
+    #    那时 armed 还是 false,而点「启用电机」本身就不止 600ms。
+    pwm_deadman_ms: 300.0
+
+    # 摇杆**指令**静止多久之后 park 舵机(ms)。0 = 关闭。判据是
+    # motor_control.IdlePark(纯状态机,motor_driver_test.test_idle_park 覆盖)。
+    # ⚠️ 这**不是**第二套链路门。deadman 管的是「链路还在不在」,这个管的是
+    #    「链路好着、但根本没在下指令」。给舵机单独做一层**链路**滞回是禁止的
+    #    (见上方舵机段:会回归成「电机停了、舵机还咬着转角」);本参数只在
+    #    指令内容全零时生效,与链路通断无关。
+    # ⚠️ 滞回是**不对称**的:进 idle 要连续静满这么久,退 idle 是**第一个非零样本
+    #    立刻退**。所以「舵机落后于指令」在结构上不可能出现,只是松手后多等一会。
+    # 为什么是等 1 秒而不是立刻:行进中松一下手、或摇杆回中时指尖渗出千分之几的
+    #    残余(中位微抖),立刻 park 会让舵机跟着一放一收地抽。1s 足够滤掉这两类。
+    # 为什么值得做:不 park 时舵机被持续通电顶在 servo_center_us 上,内部模拟控制环
+    #    一直纠偏 ⇒ 嗡嗡响 + 微抖 + 白吃电流。而实测已证明**我们发出的脉宽是干净的**
+    #    (servo_pulse_probe.py:中位 1502µs、p1/p99 1500/1625、坏帧 0.4 次/秒),
+    #    抖不来自脉宽信号 —— 软件侧能改善它的就只剩「不驱动时干脆不发脉冲」。
+    #    ⚠️ 供电/机械因素(排针 5V 与 L298N 逻辑、相机同轨)软件测不到,见
+    #    motor_wiring.md 第三节。
+    # 想要 A/B 对照:改 0 重启,行为退回「一 armed 就恒顶中位」。
+    servo_idle_park_ms: 1000.0
+
+    # ── 舵机 (SG90 一类小舵机,辅助转向) ──
+    # 只给 pwm_proc;motor_driver 的 declare 列表是白名单,多出来的键它静默忽略,
+    # 所以加这一块**不需要改 motor_driver.py**(和 pwm_cmd_hz/pwm_deadman_ms 同理)。
+    #
+    # 它和电机共用 pwm_proc 的**同一个** deadman/armed 门 —— 这正是它不拆成独立
+    # 进程的理由:拆了就要有第二份门控状态,可能出现「电机停了、舵机还咬着转角」。
+    # (严格说不是原子的:两次调用、两个线程周期 1ms/20ms,最坏有一帧 20ms 错位,
+    #  即 deadman 归零最坏 300+20=320ms。但不会**永远**咬着。)
+    servo_enable: true          # ⚠️ 置 true 后 steer_mode 才能选 servo/both。
+                                # false 时**连 GPIO line 都不申请**,而且 steer_mode
+                                # 若仍是 servo/both,pwm_proc 会**直接退出** ——
+                                # 故意的:那时整车无法转向,半启动更糟。
+                                # true 时若申请失败,**整个 pwm_proc 也会退出**。
+    servo_line: 33              # GPIO_33 → pin28。⚠️ 本项目的 pin↔GPIO 映射只对
+                                # 电机/编码器那 10 条做过核验,这条是本次新查的,
+                                # 上板前自己 gpioinfo | grep -w 33 核实一遍是 unused。
+                                # 备选:26(GPIO_22,同行 25 就是 GND)/ 27(GPIO_32)。
+                                # **别动** 0/12/5/1 —— 那是编码器规划占用的。
+    servo_freq: 50.0            # Hz。**别往上调** —— 脉宽必须短于帧周期,调高会让
+                                # 舵机收到持续高电平而堵转发热(SoftServoPwm.__init__
+                                # 里有 ValueError 守卫,motor_hw.py)
+    servo_center_us: 1500.0     # a=0 的脉宽。**机械中位偏了改这里,不是改摇杆**
+    servo_range_us: 500.0       # a=±1 相对中位的偏移 → 1000..2000µs
+    servo_min_us: 500.0         # 电气硬下限
+    servo_max_us: 2500.0        # 电气硬上限:即使 range 配错也不会顶到机械限位堵转
+    servo_invert: false         # ⚠️ **与 swap_lr 无关!** swap_lr 翻的是差速转向,
+                                # 这个翻的是舵机自己的机械安装方向,两个是独立的未知量。
+                                # 判据是实车看「车头往左转时舵机是不是也往左偏」,
+                                # **别照着名字猜** —— flip_left/flip_right 已经因为
+                                # 「照名字猜」栽过一次(见上面 swap_lr 段)。
+    servo_deadband: 0.0         # >0 掐掉中位抖动(舵机嗡嗡响/白吃电流时调它)。
+                                # 默认 0.0 = 关,与「不做任何限幅」的规定一致。
+
+    # ── 转向由谁做 (pwm_proc.py 专用) ──
+    # 三选一,是**互斥**的,不是一个「叠加」开关:
+    #   servo —— a **只**给舵机;轮子只吃油门、两轮等速(差速项彻底为 0)。
+    #            需要 servo_enable: true,否则 pwm_proc 直接退出(见下)。
+    #   diff  —— 老行为。a 只进差速混控,舵机恒 park、不参与。
+    #   both  —— a 两边都吃(2026-09-15 那版「保留差速 + 舵机做辅助」的设计)。
+    #
+    # 不把差速和舵机做成可叠加的开关,是因为两者同时转向会**互相打架** ——
+    # 舵机把轮子掰向一边、差速又把车身转向另一边,车会又转又拧。
+    #
+    # ⚠️ 选了 servo/both 但舵机没构造起来 → **整个进程退出**,不做降级:
+    #    那时轮子已经不吃 a 了,整车无法转向,而它在日志上和正常的一模一样。
+    steer_mode: servo
+
+    # ── 速度上限 (钳制 /cmd_vel) ──
+    max_linear_speed: 0.3       # m/s, 室内 SLAM 慢速
+    max_angular_speed: 1.0      # rad/s
+
+    # ── 时序 / 安全 ──
+    control_hz: 50.0
+    odom_hz: 50.0
+    cmd_vel_timeout: 0.5        # s, 看门狗 (无指令自动停 + 解除 armed)
+    arm_on_start: false         # 上电默认禁电机
+
+    # ── 坐标系 ──
+    odom_frame: odom
+    base_frame: base_link
+
+    # ── GPIO (以 gpioinfo 实测为准) ──
+    # 每路电机 3 信号脚: PWM(控速) + INA/INB(互补方向, L298N 式)
+    gpiochip: gpiochip0
+    # ⚠️ 这里只写「通道 L / 通道 R」,**不写左右轮** —— 通道与物理轮是交叉的(见上面
+    #    swap_lr 段)。写「左电机」的话就和那段自相矛盾,而这个矛盾正是当初调错方向的来源。
+    pwm_l_line: 91              # GPIO_91  → pin32  通道 L PWM/ENA
+    ina_l_line: 61              # GPIO_61  → pin18  通道 L 方向 IN1
+    inb_l_line: 62              # GPIO_62  → pin31  通道 L 方向 IN2
+    pwm_r_line: 63              # GPIO_63  → pin36  通道 R PWM/ENB
+    ina_r_line: 60              # GPIO_60  → pin37  通道 R 方向 IN1
+    inb_r_line: 124             # GPIO_124 → pin33  通道 R 方向 IN2
+    enc_l_a: 0                  # GPIO_00  → pin7
+    enc_l_b: 12                 # GPIO_12  → pin8
+    enc_r_a: 5                  # GPIO_05  → pin11
+    enc_r_b: 1                  # GPIO_01  → pin10
+
+    # ── 编码器 ──
+    # false = 编码器未接线 → 纯前馈开环控制(跳过 PID,不申请编码器 GPIO)。
+    #   开环下 duty = pid_ff × |目标速度| / max_linear_speed,与摇杆量线性对应。
+    #   注意: /odom 会恒为原点,跑 SLAM 时请改用 USE_WHEEL_ODOM=0 激光 ICP。
+    # 接上编码器后置 true,并标定 counts_per_meter / enc_sign_*。
+    use_encoders: false
+
+    # ── 测试注入 ──
+    use_mock_hw: false          # true 时用 FakeMotorHW (无硬件联调)
+    # 仅 use_mock_hw:=true 时有效。false = 模拟「编码器没接线」:FakeMotorHW
+    #   恒返回 0 计数。用来复现「闭环代码 + 反馈恒 0」这一组合 —— 修复前
+    #   「松手不停」的成因,motor_mock_test.py 轮次 C 用它做回归。
+    mock_encoder_feedback: true

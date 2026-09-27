@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# 运行产物 / 日志 / 地图二进制
+*.log
+*.pgm
+fire_events/
+data/fire_events/
+
+# 含真实密钥的文件 —— 不进 git（仍留在磁盘）
+ai/claude_config.sh
+ai/litellm_config.yaml
+ai/api_proxy.py
