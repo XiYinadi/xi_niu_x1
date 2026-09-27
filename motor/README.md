@@ -46,4 +46,4 @@
 | `motor/servo_pulse_probe.py` | **舵机脉宽实测**：Proxy 包住真实 `_line` 量脉冲串，判「抖」是不是我们信号造成的 |
 | `motor/motor_test.py` | 最小单轮测试（`--observe` 用人眼判定；不跑 ROS） |
 | `motor/motor_driver_test.py` | 纯逻辑离线测试（`test_deadman` / `test_idle_park` 等，退出码 0=全过） |
-| `web/web_drive_test.js` | **网页驾驶控件离线测试**（`node ~/web_drive_test.js`，现 104 项）：从 `slam_viz.py` 抽出**真实内联 JS** 在假 DOM 上跑。⚠️ 假 DOM 要能验「停发」就得先有真的 `clearInterval` 与 `window.addEventListener` 捕获 —— 文件在 `web/` |
+| `web/web_drive_test.js` | **网页驾驶控件离线测试**（`node ~/web_drive_test.js`，退出码 0 = 全过，现 104 项）：从 `slam_viz.py` 抽出**真实内联 JS** 在假 DOM 上跑，覆盖双杆/单杆/切换安全/键盘/模式记忆/建图按钮/**页面不可见时停发**/**拖拽 pointermove（第 11 节）**/**云台摇杆（第 12 节）**；顺带静态核对 HTML↔JS 的 id 接线。⚠️ 假 DOM 要能验「停发」就得先有真的 `clearInterval` 与 `window.addEventListener` 捕获（原来一个是空函数、一个直接丢弃），`read()` 还必须跳过已停的定时器 —— 文件在 `web/` |
