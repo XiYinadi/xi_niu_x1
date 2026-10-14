@@ -15,7 +15,7 @@ slam_viz.py — 犀牛派 SLAM 实时 Web 可视化
   source /opt/ros/humble/setup.bash
   source ~/lidar_ws/install/setup.bash
   python3 slam_viz.py
-  浏览器打开 http://192.168.31.218:5800
+  浏览器打开 http://<LAN-IP>:5800
 """
 
 import base64
@@ -33,7 +33,6 @@ import threading
 import time
 import urllib.request
 from collections import deque
-from pathlib import Path
 
 # AidLux: ROS2 env overrides PYTHONPATH, Flask/Pillow are in system site-packages
 for site_pkg in [
@@ -48,12 +47,12 @@ from PIL import Image
 
 # ── Flask + SocketIO ──────────────────────────────────────────────
 from flask import Flask, render_template_string, request
-from flask_socketio import SocketIO, emit
+from flask_socketio import SocketIO
 
 # ── ROS2 ───────────────────────────────────────────────────────────
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from nav_msgs.msg import OccupancyGrid
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
@@ -163,7 +162,7 @@ def occgrid_to_png_base64(msg: OccupancyGrid) -> dict:
     """Convert OccupancyGrid → base64 PNG + metadata dict.
 
     Returns dict with keys: png (base64 str), width, height, resolution,
-    origin_x, origin_y, map_seq.
+    origin_x, origin_y.
     """
     w, h = msg.info.width, msg.info.height
     if w == 0 or h == 0:
@@ -234,8 +233,7 @@ class SlamVizNode(Node):
         self._latest_map_msg = None
         self._latest_scan_xy = []
         self._map_dirty = False
-        self._scan_count = 0
-        self._map_count = 0
+        self._scan_count = 0    # /scan 变更序号(broadcast_loop 用它判「新一帧」)
 
         # 「建图到底在不在跑」只能靠**数据流**判 —— 计数器只能证明「曾经收到过」,
         # 证明不了「现在还在收」。0.0 表示从没收到过(monotonic 单调,不会是 0)。
@@ -302,7 +300,6 @@ class SlamVizNode(Node):
         with self._lock:
             self._latest_map_msg = msg
             self._map_dirty = True
-            self._map_count += 1
             self._last_map_t = time.monotonic()
 
     def _scan_cb(self, msg: LaserScan):
@@ -364,6 +361,7 @@ class SlamVizNode(Node):
                 result["scan"] = {
                     "points": self._latest_scan_xy,
                     "count": len(self._latest_scan_xy) // 2,
+                    "seq": self._scan_count,   # 变更序号:broadcast 用它判「新一帧」
                 }
 
             # Trajectory: 只给**增量**,没有新点就整个不放进 result
@@ -403,14 +401,8 @@ class SlamVizNode(Node):
                     "yaw": round(pyaw, 3),
                 }
 
-            result["_stats"] = {
-                "map_count": self._map_count,
-                "scan_count": self._scan_count,
-            }
-
-            # 建图状态判据(见 mapping_status)。**另起一个键,不动 _stats** ——
-            # _stats 连广播循环那关都过不去(只转发 map/scan/trajectory/pose),
-            # 改它等于顺手改既有结构。
+            # 建图状态判据(见 mapping_status)。feed 是**独立键** —— 广播循环只转发
+            # map/scan/trajectory/pose,feed 只在 _map_state_payload 里被消费,不进客户端。
             now = time.monotonic()
             result["feed"] = {
                 "scan_age": (now - self._last_scan_t) if self._last_scan_t else None,
@@ -431,7 +423,7 @@ class SlamVizNode(Node):
 # ══════════════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "slam-viz-secret"
+app.config["SECRET_KEY"] = "CHANGE-ME-public"
 socketio = SocketIO(
     app,
     async_mode="threading",
@@ -556,7 +548,7 @@ _ros_node: SlamVizNode = None  # set by main()
 def broadcast_loop():
     """SocketIO background task: poll ROS state → WebSocket emit."""
     last_map_emit = 0.0
-    last_scan_hash = None
+    last_scan_seq = None
     last_pose_key = None
     last_map_status = None
     log.info("Broadcast loop started")
@@ -596,13 +588,12 @@ def broadcast_loop():
                         state["map"]["resolution"],
                     )
 
-            # Emit scan when changed
+            # Emit scan when a new /scan frame arrived (seq 由 _scan_cb 递增)。
+            # 之前用 hash(len(points)) 判变 —— 点数不变时整个激光叠加层冻结,是 bug。
             if "scan" in state:
-                pts = state["scan"]["points"]
-                h = hash(len(pts)) if pts else None
-                if h != last_scan_hash:
+                if state["scan"]["seq"] != last_scan_seq:
                     socketio.emit("scan", state["scan"])
-                    last_scan_hash = h
+                    last_scan_seq = state["scan"]["seq"]
 
             # 轨迹:state 里只在**真的有新点**时才带这个 key,所以这里是真·增量
             if "trajectory" in state:
@@ -1233,7 +1224,7 @@ def main():
     threading.Thread(target=log_tail_loop, daemon=True).start()
 
     log.info("Starting Flask-SocketIO on 0.0.0.0:%d", PORT)
-    log.info("Open http://192.168.31.218:%d in your browser", PORT)
+    log.info("Open http://<LAN-IP>:%d in your browser", PORT)
 
     try:
         socketio.run(app, host="0.0.0.0", port=PORT)
@@ -1256,25 +1247,36 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <style>
   :root {
-    --bg:#0a0a14; --panel:#0d0d18; --panel2:#12121f; --line:#1e2030;
-    --fg:#c8ccd4; --dim:#6b7080; --accent:#00d2ff;
+    --bg:#1c1c24; --bg-2:#16161d;
+    --panel:rgba(255,255,255,0.055); --panel2:rgba(255,255,255,0.09);
+    --line:rgba(255,255,255,0.10);
+    --fg:#e7e9f0; --dim:#8a90a2; --accent:#7c8cff;
+    --accent-soft:rgba(124,140,255,0.16);
+    --shadow:0 10px 34px rgba(0,0,0,0.38);
+    --radius:12px;
   }
   * { margin:0; padding:0; box-sizing:border-box; }
   html,body { height:100%; }
   body {
-    background:var(--bg); color:var(--fg); overflow:hidden;
-    font-family:'Segoe UI',system-ui,sans-serif;
+    background:
+      radial-gradient(1100px 700px at 12% -10%, rgba(124,140,255,0.14), transparent 60%),
+      radial-gradient(900px 620px at 105% 110%, rgba(168,120,255,0.12), transparent 60%),
+      var(--bg);
+    color:var(--fg); overflow:hidden;
+    font-family:'Segoe UI',system-ui,-apple-system,'Helvetica Neue',sans-serif;
+    overscroll-behavior:none;   /* 手机上抑制下拉刷新抢触摸 */
   }
 
   /* ── 顶栏 ─────────────────────────────── */
   #status-bar {
     position:fixed; top:0; left:0; right:0; height:34px; z-index:30;
     display:flex; align-items:center; gap:18px; padding:0 14px; font-size:12px;
-    background:rgba(10,10,20,0.94); border-bottom:1px solid var(--line);
+    background:rgba(28,28,36,0.62); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
+    border-bottom:1px solid var(--line);
   }
   #status-conn { display:flex; align-items:center; gap:6px; }
-  #conn-dot { width:8px; height:8px; border-radius:50%; background:#f44; }
-  #conn-dot.live { background:#0f0; box-shadow:0 0 6px #0f0; }
+  #conn-dot { width:8px; height:8px; border-radius:50%; background:#f45; }
+  #conn-dot.live { background:#4ade80; box-shadow:0 0 8px rgba(74,222,128,.6); animation:pulse 2s infinite; }
   .stat-label { color:var(--dim); margin-right:4px; }
   .spacer { flex:1; }
   #s-clock { color:var(--dim); font-variant-numeric:tabular-nums; }
@@ -1289,11 +1291,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   /* 右列行高按各面板折叠状态由 JS updateGridClasses() 内联计算 */
 
   .win {
-    background:var(--panel); border:1px solid var(--line); border-radius:8px;
+    background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+    backdrop-filter:blur(12px) saturate(140%); -webkit-backdrop-filter:blur(12px) saturate(140%);
+    box-shadow:var(--shadow);
     display:flex; flex-direction:column; overflow:hidden; min-height:0; min-width:0;
     transition:border-color .15s;
   }
-  .win:hover { border-color:#2a2e44; }
+  .win:hover { border-color:rgba(255,255,255,0.18); }
   .win-title {
     display:flex; align-items:center; gap:10px;
     padding:5px 10px; font-size:12px; flex:0 0 auto;
@@ -1308,11 +1312,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .win-title .grp { margin-left:auto; display:flex; gap:2px; }
   .btn {
     cursor:pointer; color:var(--dim); background:transparent; border:none;
-    font-size:13px; line-height:1; padding:3px 7px; border-radius:4px;
+    font-size:13px; line-height:1; padding:4px 10px; border-radius:999px;
     font-family:inherit;
   }
-  .btn:hover { background:#1e2030; color:#fff; }
-  .btn.active { background:#0a6; color:#fff; }
+  .btn:hover { background:rgba(255,255,255,0.08); color:#fff; }
+  .btn.active { background:var(--accent); color:#14141c; }
   .btn:disabled { opacity:.35; cursor:default; }
   .win-body { flex:1 1 auto; position:relative; overflow:hidden; background:#000; }
   .win.collapsed .win-body { display:none; }
@@ -1326,13 +1330,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #win-cam  { grid-column:2; grid-row:1; }
   #win-fire { grid-column:2; grid-row:2; }
   #win-log  { grid-column:2; grid-row:3; }
-  #map-body { background:#0a0a14; }
-  #map-canvas { width:100%; height:100%; display:block; cursor:grab; }
+  #map-body { background:#0a0a14; }   /* 与 render() 里 canvas 清屏色 #0a0a14 一致 */
+  #map-canvas { width:100%; height:100%; display:block; cursor:grab; touch-action:none; }
   #map-canvas:active { cursor:grabbing; }
   #legend {
     position:absolute; left:10px; bottom:10px; z-index:2;
-    display:flex; gap:14px; font-size:11px; color:#9aa0b0;
-    background:rgba(10,10,20,0.72); padding:4px 10px; border-radius:6px;
+    display:flex; gap:14px; font-size:11px; color:var(--dim);
+    background:rgba(22,22,29,0.72); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px);
+    padding:5px 12px; border-radius:999px;
     border:1px solid var(--line); pointer-events:none;
   }
   #legend .lg { display:flex; align-items:center; gap:5px; }
@@ -1341,35 +1346,37 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   /* ── 驾驶面板 (地图窗口右下角) ───────────── */
   #drive {
     position:absolute; right:10px; bottom:10px; z-index:6;
-    background:rgba(13,13,24,0.92); border:1px solid var(--line); border-radius:10px;
+    background:rgba(24,24,32,0.72); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
+    border:1px solid var(--line); border-radius:var(--radius);
+    box-shadow:var(--shadow);
     padding:8px; display:flex; flex-direction:column; gap:6px;
     font-size:12px; user-select:none;
   }
   #drive-title { color:var(--dim); font-weight:600; text-align:center; }
   #drive-btns { display:flex; gap:6px; }
   #btn-arm {
-    flex:1; padding:6px 8px; border:none; border-radius:6px; cursor:pointer;
-    background:#2a2e44; color:var(--dim); font-size:12px; font-family:inherit;
+    flex:1; padding:6px 8px; border:none; border-radius:999px; cursor:pointer;
+    background:rgba(255,255,255,0.07); color:var(--dim); font-size:12px; font-family:inherit;
     transition:background .15s, color .15s;
   }
-  #btn-arm.armed { background:#0a6; color:#fff; }
+  #btn-arm.armed { background:var(--accent); color:#14141c; }
   #btn-arm:disabled { opacity:.4; cursor:default; }
   #btn-estop {
-    flex:1; padding:6px 8px; border:none; border-radius:6px; cursor:pointer;
-    background:#5a1010; color:#ff9090; font-size:12px; font-family:inherit;
+    flex:1; padding:6px 8px; border:none; border-radius:999px; cursor:pointer;
+    background:rgba(255,90,90,0.14); color:#ff9090; font-size:12px; font-family:inherit;
   }
-  #btn-estop:active { background:#c00; color:#fff; }
+  #btn-estop:active { background:#e5484d; color:#fff; }
   /* 建图按钮:放在地图窗口标题栏、和视图 glyph **同一组**的首位。
      不另起一个 span.grp —— .grp 带 margin-left:auto,两个 auto 会把空白平分,
      按钮就飘到标题中间去了。配色沿用 #btn-arm 那套。 */
   #btn-map {
-    padding:3px 9px; margin-right:6px; border:none; border-radius:4px; cursor:pointer;
-    background:#2a2e44; color:var(--dim); font-size:11px; font-family:inherit;
+    padding:3px 12px; margin-right:6px; border:none; border-radius:999px; cursor:pointer;
+    background:rgba(255,255,255,0.07); color:var(--dim); font-size:11px; font-family:inherit;
     transition:background .15s, color .15s; white-space:nowrap;
   }
   #btn-map:hover { color:#fff; }
-  #btn-map.on      { background:#0a6;    color:#fff; }       /* 建图中 */
-  #btn-map.partial { background:#7a5a10; color:#ffd479; }    /* 雷达在,SLAM 没起 */
+  #btn-map.on      { background:var(--accent); color:#14141c; }           /* 建图中 */
+  #btn-map.partial { background:rgba(255,179,64,0.18); color:#ffd479; }    /* 雷达在,SLAM 没起 */
   #btn-map:disabled { opacity:.4; cursor:default; }
   /* ── 双摇杆 (RC 车模式):左盘纵轴=油门,右盘横轴=转向 ──────────────
      原来是单个 240px 的 2D 盘,放大是为了「同样的手指位移对应的指令更小」,
@@ -1383,9 +1390,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     width:150px; height:150px; border-radius:50%; position:relative;
     background:
       radial-gradient(circle at 50% 50%, transparent 0 32%,
-        rgba(122,140,200,.20) 32% 32.7%, transparent 32.7% 64.5%,
-        rgba(122,140,200,.20) 64.5% 65.2%, transparent 65.2%),
-      radial-gradient(circle at 50% 50%, #1a1a2e, #0e0e1c);
+        rgba(124,140,255,.24) 32% 32.7%, transparent 32.7% 64.5%,
+        rgba(124,140,255,.24) 64.5% 65.2%, transparent 65.2%),
+      radial-gradient(circle at 50% 50%, rgba(255,255,255,0.06), rgba(0,0,0,0.28));
     border:1px solid var(--line); cursor:grab; touch-action:none;
   }
   .joy-pad::before, .joy-pad::after {
@@ -1396,12 +1403,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .joy-pad::after  { top:50%; left:6%; right:6%; height:1px; margin-top:-.5px; }
   .joy-pad.axis-y::before { background:var(--accent); opacity:.55; width:2px; margin-left:-1px; }
   .joy-pad.axis-x::after  { background:var(--accent); opacity:.55; height:2px; margin-top:-1px; }
-  .joy-pad:active { cursor:grabbing; border-color:#3a4a7a; }
+  .joy-pad:active { cursor:grabbing; border-color:rgba(124,140,255,.5); }
   .joy-knob {
     position:absolute; left:50%; top:50%; width:52px; height:52px; z-index:2;
     margin:-26px 0 0 -26px; border-radius:50%;
-    background:var(--accent); opacity:.85; pointer-events:none;
-    box-shadow:0 0 12px rgba(0,210,255,.4);
+    background:var(--accent); opacity:.9; pointer-events:none;
+    box-shadow:0 0 16px rgba(124,140,255,.55), inset 0 0 6px rgba(255,255,255,.35);
   }
   .joy-lab { color:var(--dim); font-size:10px; white-space:nowrap; }
   /* ── 单杆模式:一个 2D 盘同时给两轴 ────────────────────────────────
@@ -1419,13 +1426,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   /* ── 摇杆模式切换 (双杆 / 单杆) ───────────── */
   #drive-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
-  #joy-mode { display:flex; border:1px solid var(--line); border-radius:6px; overflow:hidden; }
+  #drive-head-right { display:flex; align-items:center; gap:8px; }
+  #drive.collapsed > :not(#drive-head):not(#drive-btns) { display:none; } /* 保留急停 */
+  #drive.collapsed #btn-arm { display:none; }
+  #joy-mode { display:flex; border:1px solid var(--line); border-radius:999px; overflow:hidden; background:rgba(255,255,255,0.04); }
   #joy-mode button {
-    padding:3px 9px; border:none; cursor:pointer; font-family:inherit; font-size:11px;
-    background:#2a2e44; color:var(--dim); transition:background .15s, color .15s;
+    padding:3px 11px; border:none; cursor:pointer; font-family:inherit; font-size:11px;
+    background:transparent; color:var(--dim); transition:background .15s, color .15s;
   }
   #joy-mode button + button { border-left:1px solid var(--line); }
-  #joy-mode button.on { background:var(--accent); color:#0b0b16; font-weight:600; }
+  #joy-mode button.on { background:var(--accent); color:#14141c; font-weight:600; }
   #drive-val {
     color:var(--accent); text-align:center; font-size:12px;
     font-variant-numeric:tabular-nums; white-space:pre;
@@ -1452,6 +1462,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   #gimbal-hint { color:var(--dim); text-align:center; font-size:10px; }
 
+  /* ── 云台摇杆模式切换 (双杆 / 单杆) ───────────── */
+  #gimbal-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+  #gimbal-pair { display:flex; gap:12px; justify-content:center; }
+  #gimbal-single { display:none; flex-direction:column; align-items:center; gap:2px; }
+  #gimbal.mode-single #gimbal-pair   { display:none; }
+  #gimbal.mode-single #gimbal-single { display:flex; }
+  #gimbal-mode { display:flex; border:1px solid var(--line); border-radius:999px; overflow:hidden; background:rgba(255,255,255,0.04); }
+  #gimbal-mode button {
+    padding:3px 11px; border:none; cursor:pointer; font-family:inherit; font-size:11px;
+    background:transparent; color:var(--dim); transition:background .15s, color .15s;
+  }
+  #gimbal-mode button + button { border-left:1px solid var(--line); }
+  #gimbal-mode button.on { background:var(--accent); color:#14141c; font-weight:600; }
+
   /* ── 相机窗口 ─────────────────────────── */
   #cam-img { width:100%; height:100%; object-fit:contain; display:block; background:#000; }
   #cam-err {
@@ -1465,29 +1489,29 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
     color:var(--dim); font-size:13px; background:#000;
   }
-  #fire-hud.ok  { color:#4cff4c; text-shadow:0 0 8px rgba(76,255,76,.5); }
-  #fire-hud.alarm { color:#ff2d2d; text-shadow:0 0 10px rgba(255,45,45,.7); }
+  #fire-hud.ok  { color:#4ade80; text-shadow:0 0 8px rgba(74,222,128,.5); }
+  #fire-hud.alarm { color:#ff5a5a; text-shadow:0 0 10px rgba(255,90,90,.7); animation:alarm 1s ease-in-out infinite; }
   #fire-hud.off { color:var(--dim); }
-  #s-fire.alarm { color:#ff2d2d; }
-  #s-fire.ok { color:#4cff4c; }
+  #s-fire.alarm { color:#ff5a5a; }
+  #s-fire.ok { color:#4ade80; }
 
   /* ── 日志窗口 ─────────────────────────── */
   #log-list {
     height:100%; overflow-y:auto; padding:4px 0;
-    background:#0c0c16; font-family:Consolas,'Courier New',monospace;
+    background:#0e0e15; font-family:Consolas,'Courier New',monospace;
     font-size:11px; line-height:1.55;
   }
   .log-line {
     padding:0 8px; white-space:pre-wrap; word-break:break-all;
     color:var(--fg);
   }
-  .log-line:hover { background:#141424; }
-  .lt { color:#4a5060; margin-right:8px; font-variant-numeric:tabular-nums; }
+  .log-line:hover { background:rgba(255,255,255,0.05); }
+  .lt { color:#5a6070; margin-right:8px; font-variant-numeric:tabular-nums; }
   .l-tag { margin-right:8px; font-weight:600; }
-  .lv-debug .l-msg { color:#6b7080; }
-  .lv-warn .l-msg, .lv-warning .l-msg { color:#ffa502; }
-  .lv-error .l-msg { color:#ff5a5a; }
-  .lv-critical .l-msg { color:#ff2d2d; }
+  .lv-debug .l-msg { color:var(--dim); }
+  .lv-warn .l-msg, .lv-warning .l-msg { color:#ffb454; }
+  .lv-error .l-msg { color:#ff7a7a; }
+  .lv-critical .l-msg { color:#ff5a5a; }
   #log-count { font-variant-numeric:tabular-nums; }
 
   /* ── 响应式 ───────────────────────────── */
@@ -1503,6 +1527,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .joy-pad { width:112px; height:112px; }
     .joy-knob { width:40px; height:40px; margin:-20px 0 0 -20px; }
     #joy-2d { width:140px; height:140px; }
+    /* 顶栏瘦身:Map 分辨率 / Path 点数对窄屏不重要,藏掉防溢出 */
+    #status-bar .hide-narrow { display:none; }
+  }
+
+  /* ── 微动效 ─────────────────────────────── */
+  @keyframes pulse {
+    0%, 100% { box-shadow:0 0 0 0 rgba(74,222,128,.45); }
+    50%      { box-shadow:0 0 0 6px rgba(74,222,128,0); }
+  }
+  @keyframes alarm {
+    0%, 100% { opacity:1; }
+    50%      { opacity:.55; }
   }
 </style>
 </head>
@@ -1510,9 +1546,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
 <div id="status-bar">
   <span id="status-conn"><span id="conn-dot"></span><span id="conn-text">Disconnected</span></span>
-  <span><span class="stat-label">Map</span><span id="s-map">—</span></span>
+  <span class="hide-narrow"><span class="stat-label">Map</span><span id="s-map">—</span></span>
   <span><span class="stat-label">Scan</span><span id="s-scan">—</span></span>
-  <span><span class="stat-label">Path</span><span id="s-trajectory">0</span></span>
+  <span class="hide-narrow"><span class="stat-label">Path</span><span id="s-trajectory">0</span></span>
   <span><span class="stat-label">FPS</span><span id="s-fps">0</span></span>
   <span><span class="stat-label">Fire</span><span id="s-fire">—</span></span>
   <span class="spacer"></span>
@@ -1545,9 +1581,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div id="drive">
         <div id="drive-head">
           <div id="drive-title">Drive</div>
-          <div id="joy-mode" role="group" aria-label="摇杆模式">
-            <button type="button" data-mode="dual" title="左杆油门 / 右杆转向;两轴独立,可同时满舵">双杆</button>
-            <button type="button" data-mode="single" title="一个盘同时给油门与转向;圆门,斜推时两轴各占一部分">单杆</button>
+          <div id="drive-head-right">
+            <div id="joy-mode" role="group" aria-label="摇杆模式">
+              <button type="button" data-mode="dual" title="左杆油门 / 右杆转向;两轴独立,可同时满舵">双杆</button>
+              <button type="button" data-mode="single" title="一个盘同时给油门与转向;圆门,斜推时两轴各占一部分">单杆</button>
+            </div>
+            <button class="btn" id="btn-drive-collapse" aria-expanded="true" title="折叠/展开驾驶面板">—</button>
           </div>
         </div>
         <div id="drive-btns">
@@ -1570,9 +1609,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
         <div id="drive-val">前进 +0.00　转向 +0.00</div>
         <div id="drive-hint">左杆油门 右杆转向,或 WASD/方向键</div>
-        <div id="gimbal">
-          <div id="gimbal-title">Gimbal 相机云台</div>
-          <div class="joy-wrap">
+        <div id="gimbal" class="mode-single">
+          <div id="gimbal-head">
+            <div id="gimbal-title">Gimbal 相机云台</div>
+            <div id="gimbal-mode" role="group" aria-label="云台摇杆模式">
+              <button type="button" data-mode="dual" title="水平 pan / 垂直 tilt;两轴独立,可同时满量程">双杆</button>
+              <button type="button" data-mode="single" title="一个盘同时给 pan+tilt;圆门">单杆</button>
+            </div>
+          </div>
+          <div id="gimbal-pair">
+            <div class="joy-wrap">
+              <div class="joy-pad axis-x" id="joy-gimbal-pan"><div class="joy-knob" id="knob-gimbal-pan"></div></div>
+              <div class="joy-lab">pan ←左 →右</div>
+            </div>
+            <div class="joy-wrap">
+              <div class="joy-pad axis-y" id="joy-gimbal-tilt"><div class="joy-knob" id="knob-gimbal-tilt"></div></div>
+              <div class="joy-lab">tilt ↑上 ↓下</div>
+            </div>
+          </div>
+          <div id="gimbal-single">
             <div class="joy-pad axis-y axis-x" id="joy-gimbal"><div class="joy-knob" id="knob-gimbal"></div></div>
             <div class="joy-lab">↑上 ↓下　←左 →右</div>
           </div>
@@ -1908,14 +1963,28 @@ const PADS = {
   gimbal: { el: document.getElementById('joy-gimbal'),
             knob: document.getElementById('knob-gimbal'), axes: 'xy', vx: 0, vy: 0,
             active: false, pid: null, isGimbal: true },
+  // 双杆模式的两个单轴云台盘(水平 pan / 垂直 tilt)。和上面那个 2D 盘一样带
+  // isGimbal:true,保证 driveGate 跳过它们、padList 循环里免费拿到指针注册/归零。
+  gimbalPan:  { el: document.getElementById('joy-gimbal-pan'),
+                knob: document.getElementById('knob-gimbal-pan'),  axes: 'x', vx: 0, vy: 0,
+                active: false, pid: null, isGimbal: true },
+  gimbalTilt: { el: document.getElementById('joy-gimbal-tilt'),
+                knob: document.getElementById('knob-gimbal-tilt'), axes: 'y', vx: 0, vy: 0,
+                active: false, pid: null, isGimbal: true },
 };
-const padList = [PADS.thr, PADS.steer, PADS.stick, PADS.gimbal];
+const padList = [PADS.thr, PADS.steer, PADS.stick, PADS.gimbal, PADS.gimbalPan, PADS.gimbalTilt];
 
 // 每种模式**读哪几个盘**。互斥地读是有意的:被隐藏的那个盘万一残留了 active
 // (隐藏一个正持着 pointer capture 的元素时,pointerup 不保证还会送到它),
 // 互斥能保证它绝不会偷偷继续出力。
 const MODE_PADS = { dual: [PADS.thr, PADS.steer], single: [PADS.stick] };
 let joyMode = 'dual';
+
+// 云台自己的模式映射,与驾驶的 MODE_PADS 完全独立:双杆 = pan + tilt 两个单轴盘,
+// 单杆 = 一个 2D 盘。默认单杆(保持云台一直是 2D 盘的历史行为)。
+// ⚠️ 别动上面的 MODE_PADS —— web_drive_test.js 有精确正则钉死它。
+const GIMBAL_MODE_PADS = { dual: [PADS.gimbalPan, PADS.gimbalTilt], single: [PADS.gimbal] };
+let gimbalMode = 'single';
 
 // 同一份页面开在两台设备上时,双边都会 20Hz 发 /cmd_vel,没握摇杆的那台
 // 持续灌 0 → 真值被切断 → 电机抖。服务端只认驾驶者,这里同步禁掉非驾驶者
@@ -1958,8 +2027,13 @@ function driveGate() {
 //    否则「我推了云台却没反应(其实被别人抢走了)」会被当成云台坏了。
 function gimbalGate() {
   const ok = !!socket.connected;
-  PADS.gimbal.el.style.opacity = ok ? '1' : '.4';
-  PADS.gimbal.el.style.pointerEvents = ok ? 'auto' : 'none';
+  // 三个云台盘(单杆 2D 盘 + 双杆两个单轴盘)都要刷,不是只有 PADS.gimbal 一个 ——
+  // 否则切到双杆后那两个新盘会一直停在初始的 opacity/pointerEvents。
+  for (const p of padList) {
+    if (!p.isGimbal) continue;
+    p.el.style.opacity = ok ? '1' : '.4';
+    p.el.style.pointerEvents = ok ? 'auto' : 'none';
+  }
   const other = ok && gimbalOwner !== null && mySid !== null && gimbalOwner !== mySid;
   gimbalHintEl.textContent = !ok ? '未连接 —— 云台指令发不出去'
     : other ? '云台正被另一台设备操作 —— 你一推杆就抢过来'
@@ -2007,6 +2081,17 @@ btnEstop.addEventListener('click', () => {
   //    服务端那一步管实际动作,这一步管界面,两边都要做。
   padReset(PADS.gimbal);
   socket.emit('motor_control', { action: 'estop' });
+});
+
+// 折叠会隐藏持有指针的盘:先清零并补发停止,再隐藏。急停始终可见。
+document.getElementById('btn-drive-collapse').addEventListener('click', () => {
+  const panel = document.getElementById('drive');
+  const collapsed = !panel.classList.contains('collapsed');
+  if (collapsed) releaseAll();
+  panel.classList.toggle('collapsed', collapsed);
+  const button = document.getElementById('btn-drive-collapse');
+  button.textContent = collapsed ? '+' : '—';
+  button.setAttribute('aria-expanded', String(!collapsed));
 });
 
 // ── 建图按钮 (地图窗口标题栏) ───────────────────────────────
@@ -2211,6 +2296,39 @@ try {
 // 初始化按钮高亮(没走到上面那行时也要把「双杆」点亮)。
 for (const b of modeBtns) b.classList.toggle('on', b.dataset.mode === joyMode);
 
+// ── 云台摇杆模式切换 (双杆 / 单杆) ──────────────────────────────
+// 和 setJoyMode 同一套顺序:先清正在按的盘、再切 class(隐藏一个正持着 pointer
+// capture 的元素时 pointerup 不保证送到它,盘藏了但残留 active 会继续发)。
+// ⚠️ **不能**直接调 releaseAll():那会连驾驶盘一起清、并补发一包电机零速,
+//    切云台模式不该打断正在驾驶的手。这里只清 isGimbal 盘、只补发云台零速。
+const gimbalEl = document.getElementById('gimbal');
+const gimbalModeBtns = Array.from(document.querySelectorAll('#gimbal-mode button'));
+
+function setGimbalMode(m) {
+  for (const p of padList) {
+    if (!p.isGimbal) continue;
+    p.active = false;
+    p.pid = null;         // 切模式:被隐藏的盘,旧 pid 不该再把它激活
+    padReset(p);
+  }
+  gimbalMode = (m === 'single') ? 'single' : 'dual';
+  gimbalEl.classList.toggle('mode-single', gimbalMode === 'single');
+  for (const b of gimbalModeBtns) b.classList.toggle('on', b.dataset.mode === gimbalMode);
+  try { localStorage.setItem('gimbalMode', gimbalMode); } catch (_) {}
+  // 立刻补发云台零速(与 releaseAll 里那条同样的理由:命令式直接 emit,别交给定时器)。
+  socket.emit('gimbal_control', { action: 'vel', dx: 0, dy: 0 });
+  gimbalGate();
+}
+for (const b of gimbalModeBtns) {
+  b.addEventListener('click', () => setGimbalMode(b.dataset.mode));
+}
+// 恢复上次选的模式(默认单杆;localStorage 在隐私模式/禁用 cookie 时会抛,整段包起来)。
+try {
+  if (localStorage.getItem('gimbalMode') === 'dual') setGimbalMode('dual');
+} catch (_) {}
+// 初始化按钮高亮(没走到上面那行时也要把「单杆」点亮)。
+for (const b of gimbalModeBtns) b.classList.toggle('on', b.dataset.mode === gimbalMode);
+
 // 当前目标速度:摇杆 + 键盘合并。松键/松杆即回零("死人手柄")。
 function driveTarget() {
   let l = 0, a = 0;
@@ -2283,9 +2401,14 @@ function driveTick() {
 // 与驾驶摇杆的「上=前进、右=右转」是同一套直觉,别单独翻其中一个。
 const GIMBAL_SCALE = 100;
 function gimbalTick() {
-  const p = PADS.gimbal;
-  const dx = Math.round(p.vx * GIMBAL_SCALE);
-  const dy = Math.round(-p.vy * GIMBAL_SCALE);
+  // 只读当前云台模式的那几个盘(GIMBAL_MODE_PADS);单轴盘的死轴恒 0,
+  // 所以一个式子对两种盘都成立,不必按模式分支(与 driveTarget 同理)。
+  let dx = 0, dy = 0;
+  for (const p of GIMBAL_MODE_PADS[gimbalMode]) {
+    if (!p.active) continue;
+    dx += Math.round(p.vx * GIMBAL_SCALE);
+    dy += Math.round(-p.vy * GIMBAL_SCALE);
+  }
   gimbalValEl.textContent = 'dx ' + fmtSignedInt(dx) + '　dy ' + fmtSignedInt(dy);
   // 非驾驶者的读数照常刷新(方便先看清数值再动),但没连接就别发 —— 发了也没人收,
   // 只会让 read() 之类的计数出现幻影包。

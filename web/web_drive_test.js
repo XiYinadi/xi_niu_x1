@@ -29,13 +29,19 @@ const idsInHtml = [...HTML.matchAll(/\bid="([^"]+)"/g)].map(m => m[1]);
 const dupIds = idsInHtml.filter((x, i) => idsInHtml.indexOf(x) !== i);
 const idsInJs = [...new Set([...JS.matchAll(/getElementById\('([^']+)'\)/g)].map(m => m[1]))];
 const missing = idsInJs.filter(i => !idsInHtml.includes(i));
-const modeBtnModes = [...HTML.matchAll(/<button[^>]*data-mode="([^"]+)"/g)].map(m => m[1]);
+// ⚠️ 现在 HTML 里有两个 data-mode 按钮组(#joy-mode 与 #gimbal-mode),全 HTML 扫会命中 4 个
+//    按钮,打爆下面「正好两个」的断言 —— 所以按容器切片,各自只扫自己的两个按钮。
+const joyModeBlock    = HTML.slice(HTML.indexOf('id="joy-mode"'), HTML.indexOf('id="drive-btns"'));
+const gimbalModeBlock = HTML.slice(HTML.indexOf('id="gimbal-mode"'), HTML.indexOf('id="gimbal-pair"'));
+const modeBtnModes       = [...joyModeBlock.matchAll(/data-mode="([^"]+)"/g)].map(m => m[1]);
+const gimbalModeBtnModes = [...gimbalModeBlock.matchAll(/data-mode="([^"]+)"/g)].map(m => m[1]);
 
 // ── 假 DOM ────────────────────────────────────────────────────
 // ⚠️ 每个 PADS 里的盘**都必须**在这张表里。漏一个不会报错 —— `mkEl` 的
 //    `PAD_R[id] || 100` 会给它一个**虚构的半径**,于是那个盘相关的用例拿着错的
 //    几何跑,**照样绿**。所以下面第 12 节有一条静态断言钉死这件事。
-const PAD_R = { 'joy-thr': 150, 'joy-steer': 150, 'joy-2d': 180, 'joy-gimbal': 150 };
+const PAD_R = { 'joy-thr': 150, 'joy-steer': 150, 'joy-2d': 180, 'joy-gimbal': 150,
+                'joy-gimbal-pan': 150, 'joy-gimbal-tilt': 150 };
 const store = {};              // localStorage
 const emitted = [];            // 发出去的 socket 包
 const handlers = {};           // socket.on 注册的回调
@@ -44,6 +50,7 @@ const timers = [];             // setInterval 的回调(不真的定时,手动�
 function mkEl(id) {
   const el = {
     id, style: {}, dataset: {}, textContent: '', disabled: false, _lis: {},
+    _attrs: {}, setAttribute: (k, v) => { el._attrs[k] = String(v); },
     classList: {
       add: c => el._cls.add(c), remove: c => el._cls.delete(c),
       contains: c => el._cls.has(c),
@@ -65,11 +72,13 @@ const ctx2d = new Proxy({}, { get: (t, k) => (k === 'canvas' ? { width: 800, hei
 const els = {};
 for (const m of JS.matchAll(/getElementById\('([^']+)'\)/g)) els[m[1]] = els[m[1]] || mkEl(m[1]);
 const modeBtns = ['dual', 'single'].map(m => { const e = mkEl('btn-' + m); e.dataset.mode = m; return e; });
+const gimbalModeBtns = ['dual', 'single'].map(m => { const e = mkEl('gbtn-' + m); e.dataset.mode = m; return e; });
 
 const docListeners = {};
 const document_ = {
   getElementById: id => els[id] || (els[id] = mkEl(id)),
-  querySelectorAll: sel => (sel === '#joy-mode button' ? modeBtns : []),
+  querySelectorAll: sel => (sel === '#joy-mode button' ? modeBtns
+                          : sel === '#gimbal-mode button' ? gimbalModeBtns : []),
   addEventListener: (t, f) => { (docListeners[t] = docListeners[t] || []).push(f); },
   fire: (t, ev) => (docListeners[t] || []).forEach(f => f(ev || {})),
   hidden: false, body: mkEl('body'), documentElement: mkEl('html'),
@@ -165,6 +174,8 @@ if (!missing.length) { pass++; console.log('  ok   JS 查的 ' + idsInJs.length 
 else { fail++; console.log('  FAIL JS 查了 HTML 里不存在的 id → ' + missing); }
 const btnOk = modeBtnModes.length === 2 && modeBtnModes.includes('dual') && modeBtnModes.includes('single');
 ok('#joy-mode 下正好两个按钮 dual/single', btnOk, D(modeBtnModes));
+const gbtnOk = gimbalModeBtnModes.length === 2 && gimbalModeBtnModes.includes('dual') && gimbalModeBtnModes.includes('single');
+ok('#gimbal-mode 下正好两个按钮 dual/single', gbtnOk, D(gimbalModeBtnModes));
 ok('三个盘的准线类齐全 (joy-2d 要 axis-y+axis-x 两条都亮)',
    /class="joy-pad axis-y" id="joy-thr"/.test(HTML)
    && /class="joy-pad axis-x" id="joy-steer"/.test(HTML)
@@ -636,6 +647,94 @@ ok('断线 → 云台盘禁用(opacity .4 + pointerEvents none)',
    G.style.pointerEvents === 'none' && G.style.opacity === '.4',
    D(G.style.pointerEvents) + '/' + D(G.style.opacity));
 sockConnected = true;
+
+console.log('=== 13. 云台单/双杆模式 ===');
+const GPan = els['joy-gimbal-pan'], GTilt = els['joy-gimbal-tilt'];
+// 先把云台盘刷回可点态(上一节断线把三个云台盘设成 none 了),并复位驾驶权。
+handlers['you'][0]({ sid: 'A' });
+handlers['motor_state'][0]({ armed: false, driver: null });
+
+// 默认单杆:按钮高亮 + 2D 盘直接产出 dx/dy。
+ok('默认单杆:「单杆」on、「双杆」不 on',
+   gimbalModeBtns[1].classList.contains('on') && !gimbalModeBtns[0].classList.contains('on'));
+touch(G, 1, 0);
+ok('默认单杆:#joy-gimbal 推右 → dx=100 dy=0',
+   (() => { const v = readGimbal(); return v.dx === 100 && v.dy === 0; })(), D(readGimbal()));
+release(G);
+
+// 双杆:两个独立单轴盘,各自只动一轴。
+gimbalModeBtns[0].fire('click');
+ok('切到双杆:「双杆」on、「单杆」不 on',
+   gimbalModeBtns[0].classList.contains('on') && !gimbalModeBtns[1].classList.contains('on'));
+touch(GPan, 1, 0);
+ok('双杆:pan 推右 → dx=100 dy=0',
+   (() => { const v = readGimbal(); return v.dx === 100 && v.dy === 0; })(), D(readGimbal()));
+release(GPan);
+touch(GTilt, 0, -1);
+ok('双杆:tilt 推上 → dx=0 dy=100',
+   (() => { const v = readGimbal(); return v.dx === 0 && v.dy === 100; })(), D(readGimbal()));
+release(GTilt);
+touch(GPan, 1, 0); touch(GTilt, 0, -1);
+ok('双杆:双指同时 → dx=100 dy=100(两轴独立满量程)',
+   (() => { const v = readGimbal(); return v.dx === 100 && v.dy === 100; })(), D(readGimbal()));
+release(GPan); release(GTilt);
+
+// 切回单杆:2D 盘恢复(圆门照旧)。
+gimbalModeBtns[1].fire('click');
+touch(G, 1, -1);
+ok('切回单杆:2D 盘斜推 → 71/71(圆门照旧)',
+   (() => { const v = readGimbal(); return v.dx === 71 && v.dy === 71; })(), D(readGimbal()));
+release(G);
+
+// 按住云台盘切模式 → 读数立刻归零 + 补发 (0,0)。
+gimbalModeBtns[0].fire('click');
+touch(GPan, 1, 0);
+ok('切模式前云台读数非零', readGimbal().dx !== 0, D(readGimbal()));
+emitted.length = 0;
+gimbalModeBtns[1].fire('click');
+ok('★ 按住云台盘切模式 → 读数立刻归零',
+   (() => { const v = readGimbal(); return v.dx === 0 && v.dy === 0; })(), D(readGimbal()));
+ok('★ 切模式补发云台 (0,0)',
+   emitted.some(e => e.ev === 'gimbal_control' && e.p.dx === 0 && e.p.dy === 0));
+release(GPan);
+
+// 云台盘不受电机驾驶权管:驾驶权在别人手里,三个云台盘仍可点。
+handlers['you'][0]({ sid: 'A' });
+handlers['motor_state'][0]({ armed: true, driver: 'B' });
+ok('★ 驾驶权在别人手里 → 三个云台盘仍可点',
+   G.style.pointerEvents === 'auto' && GPan.style.pointerEvents === 'auto' && GTilt.style.pointerEvents === 'auto');
+handlers['motor_state'][0]({ armed: false, driver: null });
+
+// localStorage 记忆。
+ok('localStorage 记住了 gimbalMode=single', store['gimbalMode'] === 'single', store['gimbalMode']);
+gimbalModeBtns[0].fire('click');
+ok('localStorage 记住了 gimbalMode=dual', store['gimbalMode'] === 'dual', store['gimbalMode']);
+gimbalModeBtns[1].fire('click');
+
+console.log('=== 14. 折叠驾驶面板安全 ===');
+modeBtns[0].fire('click');
+gimbalModeBtns[0].fire('click');
+handlers['you'][0]({ sid: 'A' });
+handlers['motor_state'][0]({ armed: true, driver: 'A' });
+touch(P.thr, 0, -1);
+touch(GPan, 1, 0);
+read(); readGimbal();
+emitted.length = 0;
+const collapse = els['btn-drive-collapse'];
+collapse.fire('click');
+ok('折叠立刻补发电机零速', emitted.some(e => e.ev === 'motor_control' && e.p.action === 'vel' && e.p.linear === 0 && e.p.angular === 0));
+ok('折叠立刻补发云台零速', emitted.some(e => e.ev === 'gimbal_control' && e.p.dx === 0 && e.p.dy === 0));
+ok('折叠后驾驶和云台目标归零', read().l === 0 && read().a === 0 && readGimbal().dx === 0);
+P.thr.fire('pointermove', { clientX: 75, clientY: 0, pointerId: 1 });
+GPan.fire('pointermove', { clientX: 150, clientY: 75, pointerId: 1 });
+ok('旧指针在隐藏后移动不能恢复输出', read().l === 0 && readGimbal().dx === 0);
+ok('折叠状态和辅助说明同步', drive.classList.contains('collapsed') && collapse._attrs['aria-expanded'] === 'false');
+collapse.fire('click');
+ok('展开不会恢复旧指令', !drive.classList.contains('collapsed') && read().l === 0 && readGimbal().dx === 0 && collapse._attrs['aria-expanded'] === 'true');
+ok('折叠保留急停所在按钮栏', SRC.includes('#drive.collapsed > :not(#drive-head):not(#drive-btns) { display:none; }') && /id="drive-btns">[\s\S]*?id="btn-estop"/.test(HTML));
+emitted.length = 0;
+els['btn-estop'].fire('click');
+ok('折叠后急停仍发出 estop', emitted.some(e => e.ev === 'motor_control' && e.p.action === 'estop'));
 
 console.log('\n' + pass + ' 通过, ' + fail + ' 失败');
 console.log('⚠️ 真机上仍要手验一次: 按下摇杆不放 → 点切换 → 指令必须立刻归零。');
