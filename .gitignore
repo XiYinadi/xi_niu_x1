@@ -12,3 +12,12 @@ data/fire_events/
 ai/claude_config.sh
 ai/litellm_config.yaml
 ai/api_proxy.py
+
+deps/
+data/maps/
+navigation/generated_params.yaml
+navigation/navigate_no_recovery.xml
+*.pre-navigation
+
+data/navigation_session.json
+navigation/navigate_through_no_recovery.xml

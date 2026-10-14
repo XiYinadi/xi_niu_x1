@@ -16,12 +16,13 @@ echo "fire_detect PID=$!"
 sleep 1
 source /opt/ros/humble/setup.bash
 source ~/lidar_ws/install/setup.bash
+source ~/robot/navigation/navigation_env.sh
 setsid nohup python3 ~/slam_viz.py > /tmp/slam_viz.log 2>&1 </dev/null &
 echo "slam_viz PID=$!"
 
 sleep 1
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-echo "访问   http://${IP:-192.168.31.218}:5800   (地图/相机/火情/日志)"
-echo "原始帧 http://${IP:-192.168.31.218}:5812/raw.jpg"
-echo "火情流 http://${IP:-192.168.31.218}:5812/frame.jpg"
+echo "访问   http://${IP:-<LAN-IP>}:5800   (地图/相机/火情/日志)"
+echo "原始帧 http://${IP:-<LAN-IP>}:5812/raw.jpg"
+echo "火情流 http://${IP:-<LAN-IP>}:5812/frame.jpg"
 echo "日志   tail -f /tmp/fire_detect.log /tmp/slam_viz.log"

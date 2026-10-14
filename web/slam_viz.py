@@ -46,7 +46,7 @@ import numpy as np
 from PIL import Image
 
 # ── Flask + SocketIO ──────────────────────────────────────────────
-from flask import Flask, render_template_string, request
+from flask import Flask, render_template_string, request, send_file
 from flask_socketio import SocketIO
 
 # ── ROS2 ───────────────────────────────────────────────────────────
@@ -139,6 +139,7 @@ FIRE_STATUS_INTERVAL = float(
 
 # ── Log tail config (env-overridable) ─────────────────────────────
 LOG_FILES = [
+    ("/tmp/navigation.log", "nav"),
     ("/tmp/slam_viz.log", "viz"),
     ("/tmp/motor_driver.log", "motor"),
     ("/tmp/laser_odom.log", "odom"),
@@ -415,6 +416,8 @@ class SlamVizNode(Node):
             if map_data:
                 result["map"] = map_data
 
+        if _navigation is not None:
+            result = _navigation.transform_snapshot(result)
         return result
 
 
@@ -436,6 +439,39 @@ socketio = SocketIO(
 @app.route("/")
 def index():
     return render_template_string(HTML_TEMPLATE)
+
+
+@app.route('/navigation.js')
+def navigation_script():
+    return send_file(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'navigation.js'), mimetype='text/javascript')
+
+
+@socketio.on('navigation_control')
+def navigation_control(data):
+    if _navigation is None:
+        socketio.emit('navigation_error', {'message': _navigation_error or '导航尚未就绪'}, to=request.sid)
+        return
+    try:
+        if not isinstance(data, dict):
+            raise ValueError('导航请求格式无效')
+        with _map_lock:
+            if _map_busy:
+                raise ValueError('建图操作正在进行，请稍候')
+            _navigation.control(data, request.sid)
+    except Exception as e:
+        socketio.emit('navigation_error', {'message': str(e)}, to=request.sid)
+    _navigation.emit()
+
+
+def _navigation_disarm():
+    global _motor_armed, _drive_owner
+    _motor_armed = False
+    _drive_owner = None
+    _send_drive(0.0, 0.0, False)
+    _ros_node.set_motor_arm(False)
+    _ros_node.publish_cmd_vel(0.0, 0.0)
+    _emit_motor_state()
+
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -472,7 +508,8 @@ _map_last = {"scan_age": None, "map_age": None}
 
 
 def _map_state_payload():
-    status = mapping_status(_map_last["scan_age"], _map_last["map_age"])
+    status = ("localization" if _navigation is not None and _navigation.running()
+              else mapping_status(_map_last["scan_age"], _map_last["map_age"]))
     return {
         "status": status,
         "scan_age": _map_last["scan_age"],
@@ -532,6 +569,8 @@ def _mapping_request(action: str) -> bool:
     with _map_lock:
         if _map_busy:
             return False
+        if _navigation is not None and (_navigation.running() or _navigation.busy):
+            return False
         _map_busy = True
         _map_action = action
     threading.Thread(target=_mapping_run, args=(action,), daemon=True).start()
@@ -543,6 +582,8 @@ def _mapping_request(action: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════
 
 _ros_node: SlamVizNode = None  # set by main()
+_navigation = None
+_navigation_error = None
 
 
 def broadcast_loop():
@@ -872,6 +913,8 @@ def _send_gimbal(dx, dy):
 @socketio.on("disconnect")
 def _on_disconnect():
     global _motor_armed, _drive_owner, _gimbal_owner
+    if _navigation is not None and request.sid == _navigation.nav_owner:
+        _navigation.cancel('操作者断线，导航已取消', disarm=True)
     _cam_clients.discard(request.sid)
     if not _cam_clients:
         _cam_enabled.clear()
@@ -965,9 +1008,15 @@ def _on_motor_control(data):
         # 摇杆/键盘发来已归一化 -1..1 的速度
         lin = float(data.get("linear", 0.0))
         ang = float(data.get("angular", 0.0))
+        if _navigation is not None and _navigation.navigating:
+            if abs(lin) < 0.001 and abs(ang) < 0.001 and not data.get('takeover'):
+                return  # Idle manual heartbeats must not overwrite autonomous commands.
+            _navigation.cancel('手动接管，导航已取消')
         _ros_node.publish_cmd_vel(lin, ang)
         _send_drive(lin, ang, _motor_armed)   # 别硬编码 True;见上
     elif action == "arm":
+        if _navigation is not None and (_navigation.navigating or _navigation.pending):
+            _navigation.cancel('驾驶使能改变，导航已取消')
         # 谁按的「启用电机」谁就是驾驶者;解除时让出控制权
         _motor_armed = bool(data.get("armed", False))
         _drive_owner = request.sid if _motor_armed else None
@@ -978,6 +1027,8 @@ def _on_motor_control(data):
         log.info("Motor %s (driver=%s)",
                  "ARMED" if _motor_armed else "disarmed", _drive_owner or "-")
     elif action == "estop":
+        if _navigation is not None:
+            _navigation.cancel('急停，导航已取消')
         _motor_armed = False
         _drive_owner = None
         _ros_node.publish_cmd_vel(0.0, 0.0)
@@ -1056,6 +1107,9 @@ def _on_mapping_control(data):
     action = (data or {}).get("action")
     if action not in ("start", "stop"):
         log.warning("未知 mapping_control action=%r (sid=%s)", action, request.sid)
+        return
+    if _navigation is not None and (_navigation.running() or _navigation.busy):
+        _push_log('slam', '[WARNING] 请先停止定位，再操作建图')
         return
     if _mapping_request(action):
         log.info("建图控制: %s (sid=%s)", action, request.sid)
@@ -1165,6 +1219,10 @@ def _on_connect(auth=None):
     socketio.emit("mapping_state", _map_state_payload(), to=request.sid)
     # 让客户端知道自己的 sid,才能判断「我是不是驾驶者」
     socketio.emit("you", {"sid": request.sid}, to=request.sid)
+    if _navigation is not None:
+        socketio.emit('navigation_state', _navigation.payload(), to=request.sid)
+    elif _navigation_error:
+        socketio.emit('navigation_error', {'message': _navigation_error}, to=request.sid)
 
     # 轨迹走的是**增量**,新客户端手里没有历史 —— 不补这一发,它就只会从
     # 「连上的那一刻」开始画,之前走过的路是空的(刷新页面、开第二个标签页
@@ -1187,12 +1245,14 @@ def _on_log_clear():
 
 def _shutdown(signum, frame):
     log.info("Received signal %s, shutting down...", signum)
+    if _navigation is not None:
+        _navigation.stop()
     rclpy.shutdown()
     sys.exit(0)
 
 
 def main():
-    global _ros_node
+    global _ros_node, _navigation, _navigation_error
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
@@ -1205,6 +1265,14 @@ def main():
 
     rclpy.init(args=sys.argv[1:])
     _ros_node = SlamVizNode()
+    try:
+        sys.path.insert(0, os.path.expanduser('~/robot/navigation'))
+        from navigation_runtime import NavigationRuntime
+        _navigation = NavigationRuntime(_ros_node, socketio, _send_drive,
+            lambda: _motor_armed, lambda: _drive_owner, _navigation_disarm)
+    except Exception as e:
+        _navigation_error = '导航组件不可用：'+str(e)
+        log.exception(_navigation_error)
 
     # Spin rclpy in daemon thread
     spin_thread = threading.Thread(target=rclpy.spin, args=(_ros_node,), daemon=True)
@@ -1230,6 +1298,8 @@ def main():
         socketio.run(app, host="0.0.0.0", port=PORT)
     finally:
         log.info("Cleaning up...")
+        if _navigation is not None:
+            _navigation.stop()
         _ros_node.destroy_node()
         rclpy.shutdown()
 
@@ -1352,6 +1422,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     padding:8px; display:flex; flex-direction:column; gap:6px;
     font-size:12px; user-select:none;
   }
+  #navigation-panel { position:absolute; left:10px; top:10px; z-index:7; max-width:min(360px,90%);
+    background:rgba(24,24,32,.94); border:1px solid var(--line); border-radius:10px; padding:8px; font-size:12px; }
+  #navigation-panel summary { cursor:pointer; }
+  #navigation-panel .nav-row { display:flex; gap:5px; flex-wrap:wrap; margin-top:8px; }
+  #navigation-panel input, #navigation-panel select { min-width:0; max-width:180px; padding:5px; }
+  #nav-status, #nav-path { margin-top:8px; white-space:normal; line-height:1.5; }
   #drive-title { color:var(--dim); font-weight:600; text-align:center; }
   #drive-btns { display:flex; gap:6px; }
   #btn-arm {
@@ -1572,6 +1648,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </header>
     <div class="win-body" id="map-body">
       <canvas id="c"></canvas>
+      <details id="navigation-panel"><summary>地图与导航</summary>
+        <div class="nav-row"><input id="nav-name" placeholder="地图英文名" maxlength="64"><button class="btn" id="nav-save">保存当前地图</button></div>
+        <div class="nav-row"><select id="nav-map" aria-label="已保存地图"></select><button class="btn" id="nav-load">加载定位</button><button class="btn" id="nav-stop" disabled>停止定位</button></div>
+        <div class="nav-row"><button class="btn" id="nav-initial" disabled>设置当前位置</button><button class="btn" id="nav-target" disabled>选择目标并预览</button></div>
+        <div class="nav-row"><button class="btn" id="nav-go" disabled>开始导航</button><button class="btn" id="nav-cancel">取消导航</button></div>
+        <div id="nav-status">等待连接；先保存地图，再加载定位</div><div id="nav-path"></div>
+      </details>
       <div id="legend">
         <span class="lg"><i style="background:#999"></i>地图</span>
         <span class="lg"><i style="background:#00d2ff"></i>&lt;1m</span>
@@ -2109,6 +2192,7 @@ const MAP_UI = {
                 tip: '点一下:拉起 雷达 + 激光里程计 + 静态TF + slam_toolbox' },
   lidar_only: { text: 'SLAM 未起 ⟳', cls: 'partial',
                 tip: '雷达在出数据,但地图没有在更新 —— 雷达之后的某一环(里程计/TF/slam_toolbox)没起来或已崩。再点一次会重启整条链路' },
+  localization: { text: '定位模式', cls: null, tip: '已加载保存的地图；请先停止定位再建图' },
   mapping:    { text: '建图中', cls: 'on',
                 tip: '地图正在更新(雷达+里程计+TF+SLAM 全链路都活着)。点一下停止 —— ⚠️ 地图会丢,本项目暂不自动保存' },
 };
@@ -2121,7 +2205,7 @@ function mapPaint() {
     return;
   }
   const ui = MAP_UI[mapStatus] || MAP_UI.off;
-  btnMap.disabled = !socket.connected;
+  btnMap.disabled = !socket.connected || mapStatus === 'localization';
   btnMap.classList.toggle('on',      ui.cls === 'on');
   btnMap.classList.toggle('partial', ui.cls === 'partial');
   btnMap.textContent = ui.text;
@@ -2136,7 +2220,7 @@ socket.on('mapping_state', st => {
 });
 
 btnMap.addEventListener('click', () => {
-  if (mapBusy) return;
+  if (mapBusy || mapStatus === 'localization') return;
   if (mapStatus === 'mapping') {
     // 没有自动保存(slam_toolbox Humble 也没有 reset 服务),停了就没了 ⇒ 确认一次。
     if (!confirm('停止建图?当前地图会丢掉 —— 没有自动保存。')) return;
@@ -2241,7 +2325,7 @@ function releaseAll(keepPointer) {
   }
   padsReset();
   if (armed && isDriver()) {
-    socket.emit('motor_control', { action: 'vel', linear: 0, angular: 0 });
+    socket.emit('motor_control', { action: 'vel', linear: 0, angular: 0, takeover: true });
   }
   // ⚠️⚠️ 云台零速帧 **无条件发**,两处刻意与上面那条不同:
   //   ① **不判 armed / isDriver()**。云台的典型工况恰恰是「没启用电机、只在转
@@ -2536,11 +2620,11 @@ function drawTrajectory() {
 }
 
 function drawRobot() {
-  const o = w2s(0, 0);
+  const o = w2s(robotPose ? robotPose.x : 0, robotPose ? robotPose.y : 0);
   const yaw = robotPose ? robotPose.yaw : 0;
   ctx.save();
   ctx.translate(o.x, o.y);
-  ctx.rotate(-yaw);  // 屏幕 y 翻转,取负号
+  ctx.rotate(Math.PI/2-yaw);  // 屏幕 y 翻转,取负号
   // 车身
   ctx.fillStyle = '#e0e0e0';
   ctx.beginPath();
@@ -2671,6 +2755,7 @@ canvas.addEventListener('dblclick', () => { fitView(); setFollow(true); });
 socket.once('map', () => { fitView(); setFollow(true); });
 requestAnimationFrame(render);
 </script>
+<script src="/navigation.js"></script>
 </body>
 </html>"""
 

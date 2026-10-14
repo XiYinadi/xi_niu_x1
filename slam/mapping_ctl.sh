@@ -26,6 +26,7 @@
 #   3  motor_driver 在跑(会和 laser_odom 抢 odom→base_link TF)
 #   4  用法错
 #   5  source ROS 环境失败
+#   6  定位导航正在运行，必须先停止
 
 set -u
 
@@ -84,6 +85,11 @@ do_stop() {
 }
 
 do_start() {
+    # Localization owns the same scanner/TF chain. Refuse a second publisher.
+    if running 'ros2 launch .*/robot/navigation/navigation_launch[.]py'; then
+        echo "请先在网页停止定位，再启动建图"
+        return 6
+    fi
     # ── 预检:全部快速失败,文案直接指出下一步 ──────────────────
     if [ ! -e "$LIDAR_DEV" ]; then
         echo "❌ 雷达设备 $LIDAR_DEV 不存在 —— 设备重启后需要重新插拔 RPLidar 的 USB"

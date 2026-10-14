@@ -1,0 +1,15 @@
+# Fill these from measurements before enabling navigation motion.
+# Localization and planning are available without a motion calibration.
+calibrated: false
+wheelbase_m: 0.300
+length_m: 0.444
+width_m: 0.360
+max_steering_rad: null
+# Velocity represented by normalized throttle=1. Measure, do not use web MAX_LIN.
+full_throttle_mps: null
+# ROS positive angular.z is left; legacy joystick positive a is right.
+steering_sign: -1
+max_speed_mps: 0.10
+command_timeout_s: 0.25
+scan_timeout_s: 0.5
+localization_timeout_s: 3.0
