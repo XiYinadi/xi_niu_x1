@@ -39,6 +39,8 @@ class NavigationRuntime:
         self.route_preview = PatrolPreview()
         self.config = yaml.safe_load((self.here/'navigation_calibration.yaml').read_text())
         self.lock = threading.RLock()
+        self.mode = 'localization'
+        self.autonomy = None
         self.busy = False
         self.process = None
         self.active_map = None
@@ -127,6 +129,8 @@ class NavigationRuntime:
                 localized=ready, calibration_error=self.calibration_error(),
                 initial_pose_ready=all(self.lifecycle.get(k) == 3 for k in ('map_server','amcl')),
                 navigating=self.navigating, goal=self.goal, path=self.path,
+                mode=getattr(self,'mode','localization'),
+                autonomy=self.autonomy.snapshot() if getattr(self,'autonomy',None) else None,
                 pose=self.last_pose if ready else None,
                 patrols=self.patrols.list(), patrol_preview=self.route_preview.snapshot(),
                 planner_ready=self.planner.server_is_ready() and self.lifecycle.get('planner_server') == 3,
@@ -162,6 +166,9 @@ class NavigationRuntime:
 
     def localized(self, now):
         # AMCL need not republish covariance while stationary; TF must stay fresh.
+        if getattr(self,'mode','localization') == 'mapping':
+            with self.node._lock:
+                return self.running() and self.last_pose is not None and fresh(now,self.node._last_map_t,10)
         return (self.running() and self.pose_ok and self.last_pose is not None
                 and self.lifecycle.get('amcl') == 3 and self.lifecycle.get('map_server') == 3)
 
@@ -178,8 +185,10 @@ class NavigationRuntime:
                 self.command = (msg.linear.x, msg.angular.z)
                 self.last_command = time.monotonic()
 
-    def cancel(self, reason='导航已取消', disarm=False, keep_route=False):
+    def cancel(self, reason='导航已取消', disarm=False, keep_route=False, keep_mission=False):
         with self.lock:
+            if not keep_mission and getattr(self,'autonomy',None):
+                self.autonomy.cancelled(reason)
             if not keep_route and hasattr(self, 'route_preview'):
                 self.route_preview.cancel(reason)
             had_motion = self.navigating
@@ -217,6 +226,8 @@ class NavigationRuntime:
                 self.cancel('导航进程已退出，请查看运行日志', disarm=True)
                 self.process = None
                 self.status = 'error'
+            if getattr(self,'mode','localization')=='mapping' and self.status=='mapping' and self.localized(now) and all(self.lifecycle.get(k)==3 for k in ('planner_server','controller_server','bt_navigator','velocity_smoother')):
+                self.note='建图与避障服务已就绪；可预览探索目标，完成标定后开始自动建图'
             if not self.navigating:
                 return
             reason = None
@@ -349,23 +360,23 @@ class NavigationRuntime:
                                     if preview:
                                         self.path = [[p.pose.position.x, p.pose.position.y] for p in result.result.path.poses]
                                     path = list(self.path)
-                                    self.cancel('路径预览完成，未驱动车轮' if preview else '已到达目标', keep_route=on_result is not None)
+                                    self.cancel('路径预览完成，未驱动车轮' if preview else '已到达目标', keep_route=on_result is not None, keep_mission=on_result is not None)
                                     self.status = 'ready'
                                     if on_result is not None:
                                         on_result(path, None)
                                 except Exception as e:
-                                    self.cancel(str(e), disarm=not preview, keep_route=on_result is not None)
+                                    self.cancel(str(e), disarm=not preview, keep_route=on_result is not None, keep_mission=on_result is not None)
                                     if on_result is not None:
                                         on_result(None, str(e))
                         handle.get_result_async().add_done_callback(finished)
                     except Exception as e:
-                        self.cancel(str(e), disarm=not preview, keep_route=on_result is not None)
+                        self.cancel(str(e), disarm=not preview, keep_route=on_result is not None, keep_mission=on_result is not None)
                         if on_result is not None:
                             on_result(None, str(e))
             try:
                 client.send_goal_async(goal).add_done_callback(accepted)
             except Exception as e:
-                self.cancel(str(e), disarm=not preview, keep_route=on_result is not None)
+                self.cancel(str(e), disarm=not preview, keep_route=on_result is not None, keep_mission=on_result is not None)
                 if on_result is not None:
                     on_result(None, str(e))
                 else:
@@ -388,13 +399,13 @@ class NavigationRuntime:
             self.route_preview.start(task, dict(self.last_pose),
                 lambda start, target, done: self.send_goal(target, sid, preview=True, start=start, on_result=done))
 
-    def start(self, name):
+    def start(self, name=None, mode='localization'):
         with self.lock:
             if self.running():
                 raise ValueError('定位已启动；请先停止再切换地图')
             if self.armed():
                 raise ValueError('请先解除电机使能，再切换建图或定位模式')
-            mapfile = self.store.path(name)
+            mapfile = self.store.path(name) if mode=='localization' else ''
             if not Path('/dev/ttyUSB0').exists():
                 raise ValueError('雷达设备 /dev/ttyUSB0 不存在，请重新插拔雷达 USB')
             if subprocess.run(['pgrep', '-f', '^[^ ]*python3 .*motor_driver[.]py'],
@@ -416,7 +427,7 @@ class NavigationRuntime:
             self.goal = None
             self.pose_ok = False
             self.lifecycle.clear()
-            env = dict(os.environ, ROBOT_NAV_MAP=str(mapfile))
+            env = dict(os.environ, ROBOT_NAV_MAP=str(mapfile), ROBOT_NAV_MODE=mode)
             with open('/tmp/navigation.log', 'w') as log:
                 self.process = subprocess.Popen(['ros2', 'launch', str(self.here/'navigation_launch.py')],
                     env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -424,7 +435,9 @@ class NavigationRuntime:
             token = proc.joinpath('stat').read_text().split(') ', 1)[1].split()[19]
             self.session_file.write_text(json.dumps({'pid': self.process.pid, 'start': token}))
             self.active_map = name
+            self.mode = mode
             self.status, self.note = 'localizing', '正在加载地图；请在地图上设置机器人的实际位置和朝向'
+            if mode=='mapping':self.status,self.note='mapping','建图与避障服务启动中；尚未自动行驶'
 
     def stop(self):
         self.cancel('定位已停止', disarm=True)
@@ -444,6 +457,11 @@ class NavigationRuntime:
 
     def control(self, data, sid):
         action = data.get('action')
+        if action in ('explore_preview','explore_start','explore_finish','patrol_start','mission_stop','alert_ack'):
+            if not self.autonomy:raise ValueError('自动任务模块尚未就绪')
+            return self.autonomy.control(data,sid)
+        if getattr(self,'autonomy',None) and self.autonomy.active and action not in ('heartbeat','cancel','stop'):
+            raise ValueError('请先停止自动任务，再修改地图、目标或路线')
         if action == 'patrol_save':
             task = self.patrols.save(data.get('task'))
             self.socketio.emit('patrol_loaded', task, to=sid)
@@ -457,6 +475,7 @@ class NavigationRuntime:
             return
         if action == 'heartbeat':
             with self.lock:
+                if self.autonomy:self.autonomy.heartbeat(sid)
                 if self.navigating and sid == self.nav_owner:
                     self.last_client = time.monotonic()
             return
@@ -467,7 +486,7 @@ class NavigationRuntime:
             self.initial_pose(data)
         elif action in ('goal', 'preview'):
             self.send_goal(data, sid, preview=action == 'preview')
-        elif action in ('save', 'load', 'stop'):
+        elif action in ('save', 'load', 'stop','prepare_mapping'):
             with self.lock:
                 if self.busy:
                     raise ValueError('地图操作正在进行，请稍候')
@@ -482,6 +501,8 @@ class NavigationRuntime:
                             raise ValueError('没有新鲜地图可保存，请先启动建图')
                         path = self.store.save(msg, data.get('name'))
                         self.note = '地图已保存：'+path.parent.name
+                    elif action=='prepare_mapping':
+                        self.start(mode='mapping')
                     elif action == 'load':
                         self.start(data.get('name'))
                     else:

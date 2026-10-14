@@ -35,6 +35,16 @@ class Arbitration(unittest.TestCase):
         self.client.emit('motor_control',dict(action='vel',linear=0,angular=0))
         web._send_drive.assert_not_called();web._navigation.cancel.assert_not_called()
 
+    def test_idle_manual_zero_cannot_overwrite_automatic_dwell(self):
+        web._navigation.navigating=False;web._navigation.autonomy.active=True
+        self.client.emit('motor_control',dict(action='vel',linear=0,angular=0))
+        web._send_drive.assert_not_called();web._navigation.cancel.assert_not_called()
+
+    def test_nonzero_cancels_automatic_dwell(self):
+        web._navigation.navigating=False;web._navigation.autonomy.active=True
+        self.client.emit('motor_control',dict(action='vel',linear=.2,angular=0))
+        web._navigation.cancel.assert_called_once()
+
     def test_explicit_zero_takes_over(self):
         self.client.emit('motor_control',dict(action='vel',linear=0,angular=0,takeover=True))
         web._navigation.cancel.assert_called_once()

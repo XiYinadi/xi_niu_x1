@@ -331,6 +331,11 @@ ok('busy 期间点击不发包(防双击起两份)', emitted.length === 0, D(emi
 fireMap({ status: 'off', scan_age: null, map_age: null, busy: true, action: 'stop' });
 ok('busy(stop) → 文案「停止中…」', btnMap.textContent === '停止中…', btnMap.textContent);
 
+fireMap({status:'mapping',busy:false,managed:true});
+ok('自动管线有新鲜地图时如实显示建图中，普通开关禁用',btnMap.textContent==='建图中' && btnMap.disabled);
+emitted.length=0;btnMap.fire('click');
+ok('自动管线管理期间普通开关不发启停包',emitted.length===0);
+
 // ⚠️ 最要紧的一条:按钮**不能**因为「我按过 start」就自称在建图 ——
 // 只有服务端按数据流算出 mapping 才行。
 fireMap({ status: 'off', scan_age: null, map_age: null, busy: false, action: null });

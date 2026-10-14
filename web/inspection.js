@@ -15,7 +15,8 @@
   const time=value=>value?new Date(typeof value==='number'?value*1000:value).toLocaleString('zh-CN',{hour12:false}):'未记录';
   function render() {
     if (!state) return;
-    const s=state.current,m=state.model||{},active=s&&s.status!=='completed',stats=s&&s.stats;
+    const s=state.current,m=state.model||{},active=s&&s.status!=='completed',stats=s&&s.stats,automatic=s&&s.mode==='automatic';
+    $('mode-tag').textContent=automatic?'自动巡检':'人工巡检';
     $('model-pill').classList.toggle('online',!!m.online);
     $('model-status').textContent=m.online?'本地视觉模型在线':'本地模型暂不可用';
     $('model-pill').title=m.name||m.error||'';
@@ -35,7 +36,7 @@
     if (active && s.task && s.next_step<s.planned_steps) {
       const n=s.task.waypoints.length,p=s.task.waypoints[s.next_step%n];
       $('current-point').textContent='第 '+(Math.floor(s.next_step/n)+1)+' 轮 · 点位 '+(s.next_step%n+1);
-      $('point-description').textContent='计划位置 ('+p.x.toFixed(2)+', '+p.y.toFixed(2)+') m · '+s.task.map+'。请人工确认到达后检测。';
+      $('point-description').textContent='计划位置 ('+p.x.toFixed(2)+', '+p.y.toFixed(2)+') m · '+s.task.map+(automatic?'。由导航确认到达后自动停车检测。':'。请人工确认到达后检测。');
     } else {
       $('current-point').textContent=active?'检测点 '+(s.next_step+1):s?'本次巡检已结束':'尚未创建任务';
       $('point-description').textContent=active?'确认机器人已到达需要检查的位置，保持相机画面稳定。':s?stats.overall:'选择路线，或直接开始定点检测。';
@@ -43,10 +44,10 @@
     $('progress-bar').style.width=s&&s.planned_steps?Math.min(100,s.next_step/s.planned_steps*100)+'%':'0%';
     $('progress-text').textContent=s?(s.planned_steps===null?'已完成 '+s.next_step+' 个定点记录':'已处理 '+s.next_step+' / '+s.planned_steps+' 个点次；有效检测 '+stats.checked+' 个'):'点位检测后自动记录证据';
     $('operation-message').textContent=s?s.message:'本页记录人工巡检，不会自行驱动车轮。';
-    $('capture-button').disabled=busy||!s||s.status!=='running'||!m.online||!m.camera_online;
+    $('capture-button').disabled=automatic||busy||!s||s.status!=='running'||!m.online||!m.camera_online;
     $('capture-button').textContent=s&&s.status==='sampling'?'本地模型正在检测…':'已到达此点，开始检测 ＋';
-    $('skip-button').disabled=busy||!s||s.status!=='running';
-    $('finish-button').disabled=busy||!s||s.status!=='running';
+    $('skip-button').disabled=automatic||busy||!s||s.status!=='running';
+    $('finish-button').disabled=automatic||busy||!s||s.status!=='running';
     $('report-actions').hidden=!s||s.status!=='completed';
     if (s) {
       $('open-report').href='/inspection/reports/'+s.id;

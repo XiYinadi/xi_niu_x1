@@ -141,6 +141,7 @@
     el('nav-target').disabled = !d.localized || d.busy;
     el('nav-go').disabled = !target || !d.localized || !d.navigator_ready || !!d.calibration_error || d.navigating || d.busy;
     el('nav-stop').disabled = !d.running || d.busy;
+    el('nav-stop').textContent = d.mode==='mapping'?'停止建图管线':'停止定位';
     if (d.pose) { robotPose = d.pose; }
     el('nav-path').textContent = d.path && d.path.length ? '路径预览：'+d.path.length+' 个点（未行驶）' : '';
     const taskList=el('patrol-list'), previous=taskList.value;
@@ -157,9 +158,9 @@
     stateEl.textContent = '连接已断开，导航不可用';
     for (const id of ['nav-load','nav-save','nav-initial','nav-target','nav-go','nav-stop','patrol-add','patrol-preview','patrol-save','patrol-load','patrol-new']) el(id).disabled = true;
   });
-  const cancelOnLeave = () => { if (state && state.navigating) send('cancel'); };
+  const cancelOnLeave = () => { if (state && (state.navigating || state.autonomy?.active)) send('cancel'); };
   setInterval(() => {
-    if (state && state.navigating && socket.connected && !document.hidden) send('heartbeat');
+    if (state && (state.navigating || state.autonomy?.active) && socket.connected && !document.hidden) send('heartbeat');
   }, 200);
   window.addEventListener('blur', cancelOnLeave);
   document.addEventListener('visibilitychange', () => { if (document.hidden) cancelOnLeave(); });

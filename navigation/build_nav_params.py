@@ -35,6 +35,8 @@ def build():
             marking=True, clearing=True, obstacle_min_range=0.2, obstacle_max_range=3.0,
             raytrace_min_range=0.2, raytrace_max_range=4.0))
         p['inflation_layer'].update(inflation_radius=0.45, cost_scaling_factor=3.0)
+        if key == 'global_costmap':
+            p['static_layer'].update(map_subscribe_transient_local=True,subscribe_to_updates=True)
     radius = (cfg.get('wheelbase_m') or 0.4) / math.tan(cfg.get('max_steering_rad') or 0.4)
     planner = data['planner_server']['ros__parameters']
     planner['planner_plugins'] = ['GridBased']

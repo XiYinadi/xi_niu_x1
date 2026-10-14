@@ -29,6 +29,8 @@ events.navigation_state({...ready,calibration_error:null});element('nav-go').cli
 assert.strictEqual(sent.at(-1).p.action,'goal');
 events.navigation_state({...ready,navigating:true});windowEvents.blur();
 assert.strictEqual(sent.at(-1).p.action,'cancel');
+events.navigation_state({...ready,navigating:false,autonomy:{active:true}});windowEvents.blur();
+assert.strictEqual(sent.at(-1).p.action,'cancel');
 events.navigation_state({...ready,selected_map:'room',planner_ready:true,navigating:false});
 element('patrol-dwell').value='5';element('patrol-cycles').value='2';element('patrol-name').value='round_a';
 element('patrol-add').click();canvas.listeners.pointerdown(e(200,100));canvas.listeners.pointerup(e(250,100));

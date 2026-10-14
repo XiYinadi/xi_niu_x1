@@ -142,6 +142,17 @@ class Inspection(unittest.TestCase):
             self.assertTrue(report['review_note'])
             self.assertEqual(json.loads((self.service.directory(self.sid)/'model_response.json').read_text())['content'],raw)
 
+    def test_automatic_session_rejects_manual_detection(self):
+        s=self.service.get(self.sid);s['mode']='automatic'
+        with self.assertRaises(ValueError):self.service.record(self.sid)
+        self.assertEqual(s['records'],[])
+
+    def test_alert_changes_overall_without_claiming_point_arrival(self):
+        s=self.service.get(self.sid);s['alerts']=[dict(verdict='suspected')]
+        stats=statistics(s)
+        self.assertEqual(stats['checked'],0);self.assertEqual(stats['suspected'],1)
+        self.assertIn('疑似',stats['overall'])
+
     def test_api_report_escapes_untrusted_text(self):
         s=self.recorded();s['title']='<script>alert(1)</script>'
         self.service.finish(self.sid);self.wait(lambda:s['status']=='completed')

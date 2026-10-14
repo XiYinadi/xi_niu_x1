@@ -446,6 +446,15 @@ def navigation_script():
     return send_file(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'navigation.js'), mimetype='text/javascript')
 
 
+@app.route('/autonomy.js')
+def autonomy_script():
+    return send_file(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'autonomy.js'), mimetype='text/javascript')
+
+
+def _automatic_active():
+    return getattr(getattr(_navigation,'autonomy',None),'active',False) is True
+
+
 @socketio.on('navigation_control')
 def navigation_control(data):
     if _navigation is None:
@@ -508,7 +517,8 @@ _map_last = {"scan_age": None, "map_age": None}
 
 
 def _map_state_payload():
-    status = ("localization" if _navigation is not None and _navigation.running()
+    managed = _navigation is not None and _navigation.running() and getattr(_navigation,'mode',None)=='mapping'
+    status = ("localization" if _navigation is not None and _navigation.running() and not managed
               else mapping_status(_map_last["scan_age"], _map_last["map_age"]))
     return {
         "status": status,
@@ -516,6 +526,7 @@ def _map_state_payload():
         "map_age": _map_last["map_age"],
         "busy": _map_busy,
         "action": _map_action,
+        "managed": managed,
     }
 
 
@@ -604,7 +615,7 @@ def broadcast_loop():
                 _map_last["scan_age"] = feed["scan_age"]
                 _map_last["map_age"] = feed["map_age"]
             p = _map_state_payload()
-            key = (p["status"], p["busy"], p["action"])
+            key = (p["status"], p["busy"], p["action"],p['managed'])
             if key != last_map_status:
                 socketio.emit("mapping_state", p)
                 last_map_status = key
@@ -1008,14 +1019,14 @@ def _on_motor_control(data):
         # 摇杆/键盘发来已归一化 -1..1 的速度
         lin = float(data.get("linear", 0.0))
         ang = float(data.get("angular", 0.0))
-        if _navigation is not None and _navigation.navigating:
+        if _navigation is not None and (_navigation.navigating or _automatic_active()):
             if abs(lin) < 0.001 and abs(ang) < 0.001 and not data.get('takeover'):
                 return  # Idle manual heartbeats must not overwrite autonomous commands.
             _navigation.cancel('手动接管，导航已取消')
         _ros_node.publish_cmd_vel(lin, ang)
         _send_drive(lin, ang, _motor_armed)   # 别硬编码 True;见上
     elif action == "arm":
-        if _navigation is not None and (_navigation.navigating or _navigation.pending):
+        if _navigation is not None and (_navigation.navigating or _navigation.pending or _automatic_active()):
             _navigation.cancel('驾驶使能改变，导航已取消')
         # 谁按的「启用电机」谁就是驾驶者;解除时让出控制权
         _motor_armed = bool(data.get("armed", False))
@@ -1291,6 +1302,11 @@ def main():
         task_get=inspection_task, pose=inspection_pose)
     register_inspection(app, inspection, Path.home()/'robot'/'web')
     threading.Thread(target=inspection.health_loop, daemon=True).start()
+    if _navigation is not None:
+        from autonomy_runtime import AutonomyRuntime, register_autonomy
+        _navigation.autonomy = AutonomyRuntime(_navigation, inspection)
+        register_autonomy(app, _navigation.autonomy)
+        _navigation.autonomy.start_threads()
 
     # Spin rclpy in daemon thread
     spin_thread = threading.Thread(target=rclpy.spin, args=(_ros_node,), daemon=True)
@@ -1649,6 +1665,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <span class="spacer"></span>
   <span id="s-clock">--:--:--</span>
 </div>
+<div id="autonomy-alert" hidden role="alert" style="position:fixed;top:48px;left:10%;right:10%;z-index:100;background:#642522;border:2px solid #f48772;border-radius:8px;padding:16px;color:#fff;white-space:normal"><span id="autonomy-alert-message"></span> <a id="autonomy-alert-evidence" hidden target="_blank" rel="noopener" style="text-decoration:underline">查看现场证据 ↗</a></div>
 
 <div id="workspace">
 
@@ -1668,6 +1685,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="win-body" id="map-body">
       <canvas id="c"></canvas>
       <details id="navigation-panel"><summary>地图与导航</summary>
+        <details id="autonomy-panel" open><summary>自动建图与巡检</summary>
+          <div class="nav-row"><button class="btn" id="auto-prepare">准备自动建图</button><button class="btn" id="auto-preview">查看探索目标</button></div>
+          <div class="nav-row"><button class="btn" id="auto-explore" disabled>开始自动建图</button><button class="btn" id="auto-finish" disabled>结束建图并保存</button></div>
+          <div class="nav-row"><button class="btn" id="auto-patrol" disabled>执行所选巡检任务</button><button class="btn" id="auto-stop">停止自动任务</button><button class="btn" id="auto-ack" disabled>已人工确认告警</button></div>
+          <div id="auto-status" style="white-space:normal;line-height:1.6;margin-top:8px">等待连接；发现疑似火情即停车上报</div>
+          <a id="auto-report" hidden target="_blank" rel="noopener">查看本次巡检报告 ↗</a>
+        </details>
         <div class="nav-row"><input id="nav-name" placeholder="地图英文名" maxlength="64"><button class="btn" id="nav-save">保存当前地图</button></div>
         <div class="nav-row"><select id="nav-map" aria-label="已保存地图"></select><button class="btn" id="nav-load">加载定位</button><button class="btn" id="nav-stop" disabled>停止定位</button></div>
         <div class="nav-row"><button class="btn" id="nav-initial" disabled>设置当前位置</button><button class="btn" id="nav-target" disabled>选择目标并预览</button></div>
@@ -2211,6 +2235,7 @@ const btnMap = document.getElementById('btn-map');
 let mapStatus = 'off';     // off | lidar_only | mapping  (服务端只发这三个)
 let mapBusy  = false;      // 服务端有 start/stop 在路上
 let mapAction = null;
+let mapManaged = false;
 
 // 三态 => 文案 / class / 鼠标悬停说明。文案说的是**当前状态**;
 // 点下去做什么由 mapClick() 按状态决定。
@@ -2232,22 +2257,23 @@ function mapPaint() {
     return;
   }
   const ui = MAP_UI[mapStatus] || MAP_UI.off;
-  btnMap.disabled = !socket.connected || mapStatus === 'localization';
+  btnMap.disabled = !socket.connected || mapStatus === 'localization' || mapManaged;
   btnMap.classList.toggle('on',      ui.cls === 'on');
   btnMap.classList.toggle('partial', ui.cls === 'partial');
   btnMap.textContent = ui.text;
-  btnMap.title = ui.tip;
+  btnMap.title = mapManaged ? '自动建图管线管理中，请在地图与导航中结束建图或停止管线' : ui.tip;
 }
 
 socket.on('mapping_state', st => {
   mapStatus = st.status || 'off';
   mapBusy   = !!st.busy;
   mapAction = st.action || null;
+  mapManaged = !!st.managed;
   mapPaint();
 });
 
 btnMap.addEventListener('click', () => {
-  if (mapBusy || mapStatus === 'localization') return;
+  if (mapBusy || mapStatus === 'localization' || mapManaged) return;
   if (mapStatus === 'mapping') {
     // 没有自动保存(slam_toolbox Humble 也没有 reset 服务),停了就没了 ⇒ 确认一次。
     if (!confirm('停止建图?当前地图会丢掉 —— 没有自动保存。')) return;
@@ -2783,6 +2809,7 @@ socket.once('map', () => { fitView(); setFollow(true); });
 requestAnimationFrame(render);
 </script>
 <script src="/navigation.js"></script>
+<script src="/autonomy.js"></script>
 </body>
 </html>"""
 
