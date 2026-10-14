@@ -33,12 +33,16 @@ import base64
 import json
 import os
 import re
+import sys
+import math
 import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'inspection'))
+from local_model import completion
 
 DEVICE = os.environ.get("FIRE_DETECT_DEVICE", "/dev/video2")
 STREAM_WIDTH = int(os.environ.get("FIRE_DETECT_WIDTH", 640))
@@ -67,6 +71,8 @@ FIRE_PROMPT = (
 
 _lock = threading.Lock()
 _latest_bgr = None            # 最新原始帧(BGR,numpy)
+_latest_bgr_t = 0.0
+_inspection_snapshot = None   # Exact submitted frame paired with its verdict.
 _cap_count = 0                # 帧计数(用于 MJPEG 去重编码)
 _capture_ok = False
 _verdict = {                  # 最近一次 VLM 判定
@@ -81,7 +87,7 @@ _verdict = {                  # 最近一次 VLM 判定
 
 # ── 相机捕获线程 ──────────────────────────────────────────────────
 def capture_loop():
-    global _latest_bgr, _cap_count, _capture_ok
+    global _latest_bgr, _latest_bgr_t, _cap_count, _capture_ok
     cap = None
     budget = 1.0 / FPS
     while True:
@@ -105,6 +111,7 @@ def capture_loop():
                 )
             with _lock:
                 _latest_bgr = frame
+                _latest_bgr_t = time.time()
                 _cap_count += 1
             _capture_ok = True
             time.sleep(budget)
@@ -154,7 +161,7 @@ def _vlm_ask(bgr):
     """送一帧给本地 VLM,返回 (解析后的 dict 或 None, latency秒)。"""
     ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, QUALITY])
     if not ok:
-        return None, 0.0
+        return None, 0.0, None
     b64 = base64.b64encode(buf.tobytes()).decode()
     payload = {
         "model": MODEL,
@@ -169,17 +176,10 @@ def _vlm_ask(bgr):
         "stream": False,
         "temperature": 0.7,  # 必须 > 0,0.0 会触发采样器断言 abort
     }
-    req = urllib.request.Request(
-        API_BASE + "/v1/chat/completions",
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-    )
     t = time.time()
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.loads(resp.read().decode())
+    content = completion(payload, api=API_BASE, timeout=60)
     latency = time.time() - t
-    content = data["choices"][0]["message"]["content"]
-    return _parse_content(content), latency
+    return _parse_content(content), latency, b64
 
 
 def _save_event(bgr, conf, reason):
@@ -196,21 +196,24 @@ def _save_event(bgr, conf, reason):
 
 def judge_loop():
     """判定线程:每隔 INTERVAL 秒抽最新帧送 VLM,更新 _verdict。"""
-    global _verdict
+    global _verdict, _inspection_snapshot
     while True:
         with _lock:
             bgr = _latest_bgr
+            captured_at = _latest_bgr_t
         if bgr is None:
             time.sleep(1.0)
             continue
         try:
-            obj, latency = _vlm_ask(bgr)
+            obj, latency, jpeg = _vlm_ask(bgr)
         except Exception as e:
             print(f"[fire_detect] VLM error: {e} — retry in {max(2, INTERVAL)}s",
                   flush=True)
             time.sleep(max(2.0, INTERVAL))
             continue
-        if obj is None:
+        if (not isinstance(obj, dict) or type(obj.get('fire')) is not bool
+                or type(obj.get('confidence')) not in (int, float)
+                or not math.isfinite(obj['confidence']) or not 0 <= obj['confidence'] <= 1):
             print("[fire_detect] 无法解析 VLM 回复", flush=True)
             time.sleep(max(2.0, INTERVAL))
             continue
@@ -219,6 +222,8 @@ def judge_loop():
         conf = float(obj.get("confidence", 0.0))
         reason = str(obj.get("reason", ""))[:40]
         with _lock:
+            _inspection_snapshot = dict(fire=fire, confidence=conf, reason=str(obj.get('reason',''))[:1000],
+                captured_at=captured_at, judged_at=time.time(), jpeg=jpeg, model=MODEL, conf_thresh=CONF_THRESH)
             _verdict = {
                 "fire": fire,
                 "confidence": conf,
@@ -325,6 +330,11 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path in ("/", "/index.html"):
             self._json(self._status())
+        elif path == '/inspection.json':
+            with _lock:
+                snapshot = dict(_inspection_snapshot) if _inspection_snapshot else {}
+            snapshot['capture_ok'] = _capture_ok
+            self._json(snapshot)
         elif path == "/frame.jpg":
             self._jpeg(_annotated_jpeg())
         elif path == "/raw.jpg":

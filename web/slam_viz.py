@@ -1274,6 +1274,24 @@ def main():
         _navigation_error = '导航组件不可用：'+str(e)
         log.exception(_navigation_error)
 
+    # Inspection consumes the existing camera owner's HTTP frames; never opens a camera.
+    sys.path.insert(0, os.path.expanduser('~/robot/inspection'))
+    from inspection_service import InspectionService, register_inspection
+    from pathlib import Path
+    def inspection_task(name):
+        if _navigation is None:
+            raise ValueError('任务模块尚未就绪；可以不绑定路线做定点检测')
+        return _navigation.patrols.get(name)
+    def inspection_pose():
+        if _navigation is not None and _navigation.localized(time.monotonic()):
+            return dict(_navigation.last_pose, map=_navigation.active_map, frame='map')
+        return None
+    inspection = InspectionService(Path.home()/'robot'/'data'/'inspections',
+        task_list=lambda: _navigation.patrols.list() if _navigation is not None else [],
+        task_get=inspection_task, pose=inspection_pose)
+    register_inspection(app, inspection, Path.home()/'robot'/'web')
+    threading.Thread(target=inspection.health_loop, daemon=True).start()
+
     # Spin rclpy in daemon thread
     spin_thread = threading.Thread(target=rclpy.spin, args=(_ros_node,), daemon=True)
     spin_thread.start()
@@ -1621,6 +1639,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <body>
 
 <div id="status-bar">
+  <a href="/inspection" target="_blank" rel="noopener" style="color:var(--accent);white-space:nowrap">巡检工作台 ↗</a>
   <span id="status-conn"><span id="conn-dot"></span><span id="conn-text">Disconnected</span></span>
   <span class="hide-narrow"><span class="stat-label">Map</span><span id="s-map">—</span></span>
   <span><span class="stat-label">Scan</span><span id="s-scan">—</span></span>
