@@ -4,6 +4,8 @@
   const stateEl = el('nav-status');
   const select = el('nav-map');
   let state = null, pick = null, anchor = null, target = null;
+  let draft = { name:'', map:'', cycles:1, revision:0, waypoints:[] }, dirty = false;
+  let previewMode = 'single';
   const send = (action, extra = {}) => {
     if (!socket.connected) { stateEl.textContent = '连接已断开'; return; }
     socket.emit('navigation_control', { action, ...extra });
@@ -18,10 +20,17 @@
   const beginPick = type => {
     if (!state || !state.running) { stateEl.textContent = '请先加载地图'; return; }
     if (type === 'goal' && !state.localized) { stateEl.textContent = '请先设置初始位置并等待定位'; return; }
+    if (type === 'patrol' && draft.map && draft.map !== state.selected_map) {
+      stateEl.textContent = '任务绑定的地图不同，请先加载 '+draft.map; return;
+    }
+    if (type === 'patrol' && draft.waypoints.length >= 50) {
+      stateEl.textContent = '每个任务最多 50 个巡检点'; return;
+    }
     pick = type;
+    previewMode = type === 'goal' ? 'single' : null;
     target = null;
     el('nav-go').disabled = true;
-    stateEl.textContent = '在地图按下并拖出朝向，松手确认' + (type === 'initial_pose' ? '机器人当前位置' : '目标位置');
+    stateEl.textContent = '在地图按下并拖出朝向，松手确认' + (type === 'initial_pose' ? '机器人当前位置' : type === 'patrol' ? '巡检点' : '目标位置');
   };
   el('nav-initial').addEventListener('click', () => beginPick('initial_pose'));
   el('nav-target').addEventListener('click', () => beginPick('goal'));
@@ -50,12 +59,75 @@
     const action = pick;
     pick = null; anchor = null;
     try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
-    if (action === 'initial_pose') send(action, pose);
+    if (action === 'patrol') {
+      if (!state || !state.running) return;
+      draft.map = draft.map || state.selected_map;
+      draft.waypoints.push({...pose, dwell_s:Number(el('patrol-dwell').value)});
+      changed();
+    }
+    else if (action === 'initial_pose') send(action, pose);
     else { target = pose; send('preview', pose); }
   }, true);
   canvas.addEventListener('pointercancel', () => { pick = null; anchor = null; });
+  const paintDraft = () => {
+    el('patrol-map').textContent = '绑定地图：'+(draft.map || '添加首个点时绑定当前定位地图');
+    el('patrol-points').innerHTML = draft.waypoints.map((p,i) => '<li style="margin:6px 0">'
+      +(i+1)+': ('+p.x.toFixed(2)+', '+p.y.toFixed(2)+') 朝向 '+Math.round(p.yaw*180/Math.PI)+'° '
+      +'<label>停留 <input type="number" min="0" max="3600" style="width:60px" value="'+p.dwell_s+'" data-action="dwell" data-index="'+i+'">秒</label>'
+      +'<button class="btn" data-action="up" data-index="'+i+'">上移</button>'
+      +'<button class="btn" data-action="down" data-index="'+i+'">下移</button>'
+      +'<button class="btn" data-action="remove" data-index="'+i+'">移除</button></li>').join('');
+    el('patrol-draft-status').textContent = draft.waypoints.length+' 个点；'+(dirty?'有未保存修改':'已同步')+'；配置和预览不会驱动车轮';
+  };
+  const changed = () => {
+    dirty=true;
+    previewMode=null;
+    if (state && state.patrol_preview && state.patrol_preview.status === 'planning') send('cancel');
+    paintDraft();
+  };
+  const taskPayload = () => ({ name:el('patrol-name').value,
+    map:draft.map, cycles:Number(el('patrol-cycles').value),
+    revision:el('patrol-name').value === draft.name ? draft.revision : 0,
+    waypoints:draft.waypoints.map(p=>({...p})) });
+  el('patrol-add').addEventListener('click',()=>beginPick('patrol'));
+  el('patrol-save').addEventListener('click',()=>send('patrol_save',{task:taskPayload()}));
+  el('patrol-preview').addEventListener('click',()=>{ previewMode='patrol';send('patrol_preview',{task:taskPayload()}); });
+  el('patrol-load').addEventListener('click',()=>{
+    if (dirty && !confirm('放弃当前未保存修改，载入已保存任务？')) return;
+    if (state && state.patrol_preview && state.patrol_preview.status === 'planning') send('cancel');
+    if (el('patrol-list').value) send('patrol_load',{name:el('patrol-list').value});
+  });
+  el('patrol-new').addEventListener('click',()=>{
+    if (dirty && !confirm('放弃当前未保存修改，新建任务？')) return;
+    if (state && state.patrol_preview && state.patrol_preview.status === 'planning') send('cancel');
+    draft={name:'',map:'',cycles:1,revision:0,waypoints:[]};dirty=false;
+    el('patrol-name').value='';el('patrol-cycles').value='1';pick=null;anchor=null;previewMode=null;paintDraft();
+  });
+  for (const id of ['patrol-name','patrol-cycles']) el(id).addEventListener('input',changed);
+  el('patrol-points').addEventListener('click',e=>{
+    const d=e.target.dataset || {}, i=Number(d.index);
+    if (!Number.isInteger(i) || i<0 || i>=draft.waypoints.length) return;
+    if (d.action==='remove') draft.waypoints.splice(i,1);
+    else if (d.action==='up' && i>0) [draft.waypoints[i-1],draft.waypoints[i]]=[draft.waypoints[i],draft.waypoints[i-1]];
+    else if (d.action==='down' && i<draft.waypoints.length-1) [draft.waypoints[i+1],draft.waypoints[i]]=[draft.waypoints[i],draft.waypoints[i+1]];
+    else return;
+    changed();
+  });
+  el('patrol-points').addEventListener('change',e=>{
+    const d=e.target.dataset || {}, i=Number(d.index), value=Number(e.target.value);
+    if (d.action==='dwell' && Number.isInteger(i) && draft.waypoints[i] && Number.isFinite(value) && value>=0 && value<=3600) {
+      draft.waypoints[i].dwell_s=value;changed();
+    }
+  });
+  socket.on('patrol_loaded',task=>{
+    previewMode=null;pick=null;anchor=null;
+    draft={...task,waypoints:task.waypoints.map(p=>({...p}))};dirty=false;
+    el('patrol-name').value=task.name;el('patrol-cycles').value=String(task.cycles);paintDraft();
+  });
+  paintDraft();
   socket.on('navigation_error', d => { stateEl.textContent = d.message; });
   socket.on('navigation_state', d => {
+    if (state && d.selected_map !== state.selected_map) { target=null;pick=null;anchor=null;previewMode=null; }
     state = d;
     if (d.running) trajectoryPoints = [];
     const selected = select.value;
@@ -71,11 +143,19 @@
     el('nav-stop').disabled = !d.running || d.busy;
     if (d.pose) { robotPose = d.pose; }
     el('nav-path').textContent = d.path && d.path.length ? '路径预览：'+d.path.length+' 个点（未行驶）' : '';
+    const taskList=el('patrol-list'), previous=taskList.value;
+    taskList.innerHTML=(d.patrols || []).map(t=>'<option value="'+t.name+'">'+t.name+' · '+t.points+'点 · '+t.map+'</option>').join('');
+    if ((d.patrols || []).some(t=>t.name===previous)) taskList.value=previous;
+    el('patrol-add').disabled=!d.running || d.busy;
+    el('patrol-preview').disabled=!d.localized || !d.planner_ready || d.busy || d.navigating;
+    for (const id of ['patrol-save','patrol-load','patrol-new']) el(id).disabled=!!d.busy;
+    const route=d.patrol_preview;
+    el('patrol-status').textContent=route ? route.message+(route.planned_stopped_s!==undefined?'；计划停留共 '+route.planned_stopped_s+' 秒（不含行驶）':'') : '仅配置和路线预览，不执行巡检';
   });
   socket.on('disconnect', () => {
-    pick = null; anchor = null; target = null; state = null;
+    pick = null; anchor = null; target = null; state = null;previewMode=null;
     stateEl.textContent = '连接已断开，导航不可用';
-    for (const id of ['nav-load','nav-save','nav-initial','nav-target','nav-go','nav-stop']) el(id).disabled = true;
+    for (const id of ['nav-load','nav-save','nav-initial','nav-target','nav-go','nav-stop','patrol-add','patrol-preview','patrol-save','patrol-load','patrol-new']) el(id).disabled = true;
   });
   const cancelOnLeave = () => { if (state && state.navigating) send('cancel'); };
   setInterval(() => {
@@ -88,7 +168,8 @@
   render = function() {
     originalRender();
     if (!state) return;
-    const path = state.path || [];
+    const route=state.patrol_preview;
+    const path = previewMode === 'patrol' ? (route && route.path || []) : previewMode === 'single' ? state.path || [] : [];
     if (path.length > 1) {
       ctx.save(); ctx.strokeStyle = '#ffcc66'; ctx.lineWidth = 3; ctx.beginPath();
       path.forEach((p, i) => { const s = w2s(p[0], p[1]); if (i) ctx.lineTo(s.x,s.y); else ctx.moveTo(s.x,s.y); });
@@ -101,5 +182,9 @@
       ctx.moveTo(p.x,p.y); ctx.lineTo(p.x+24*Math.cos(target.yaw),p.y-24*Math.sin(target.yaw));
       ctx.stroke(); ctx.restore();
     }
+    if (draft.map === state.selected_map) draft.waypoints.forEach((point,i)=>{
+      const p=w2s(point.x,point.y);ctx.save();ctx.fillStyle='#ffcc66';
+      ctx.beginPath();ctx.arc(p.x,p.y,5,0,2*Math.PI);ctx.fill();ctx.fillText(String(i+1),p.x+8,p.y-8);ctx.restore();
+    });
   };
 })();

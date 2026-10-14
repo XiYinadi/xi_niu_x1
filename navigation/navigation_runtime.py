@@ -16,6 +16,8 @@ from pathlib import Path
 import yaml
 from map_store import MapStore, yaw
 from navigation_core import fresh, twist_to_joystick, validate_calibration
+from patrol_store import PatrolStore, validate_task
+from patrol_preview import PatrolPreview
 
 
 class NavigationRuntime:
@@ -33,6 +35,8 @@ class NavigationRuntime:
         self.session_file.parent.mkdir(parents=True, exist_ok=True)
         self.cleanup_orphan()
         self.store = MapStore(self.root/'data'/'maps')
+        self.patrols = PatrolStore(self.root/'data'/'patrols', self.store)
+        self.route_preview = PatrolPreview()
         self.config = yaml.safe_load((self.here/'navigation_calibration.yaml').read_text())
         self.lock = threading.RLock()
         self.busy = False
@@ -124,6 +128,7 @@ class NavigationRuntime:
                 initial_pose_ready=all(self.lifecycle.get(k) == 3 for k in ('map_server','amcl')),
                 navigating=self.navigating, goal=self.goal, path=self.path,
                 pose=self.last_pose if ready else None,
+                patrols=self.patrols.list(), patrol_preview=self.route_preview.snapshot(),
                 planner_ready=self.planner.server_is_ready() and self.lifecycle.get('planner_server') == 3,
                 navigator_ready=self.nav.server_is_ready() and all(self.lifecycle.get(k) == 3 for k in ('bt_navigator','controller_server','velocity_smoother')))
 
@@ -173,8 +178,10 @@ class NavigationRuntime:
                 self.command = (msg.linear.x, msg.angular.z)
                 self.last_command = time.monotonic()
 
-    def cancel(self, reason='导航已取消', disarm=False):
+    def cancel(self, reason='导航已取消', disarm=False, keep_route=False):
         with self.lock:
+            if not keep_route and hasattr(self, 'route_preview'):
+                self.route_preview.cancel(reason)
             had_motion = self.navigating
             self.epoch += 1  # invalidate in-flight goal acceptance/results
             self.navigating = False
@@ -269,6 +276,7 @@ class NavigationRuntime:
         if not self.running():
             raise ValueError('请先加载地图')
         self.cancel('已设置初始位置，等待定位收敛')
+        self.route_preview.clear()
         p = self.pose_message(data)
         self.check_goal(p)
         msg = PoseWithCovarianceStamped()
@@ -279,7 +287,7 @@ class NavigationRuntime:
         self.last_amcl = None
         self.initial_pub.publish(msg)
 
-    def send_goal(self, data, sid, preview=False):
+    def send_goal(self, data, sid, preview=False, start=None, on_result=None):
         from nav2_msgs.action import NavigateToPose, ComputePathToPose
         from action_msgs.msg import GoalStatus
         with self.lock:
@@ -297,6 +305,8 @@ class NavigationRuntime:
                 validate_calibration(self.config)
                 if not self.armed() or self.owner() != sid:
                     raise ValueError('请先由当前页面启用电机')
+            if on_result is None:
+                self.route_preview.clear()
             self.epoch += 1
             epoch = self.epoch
             self.goal = dict(x=pose.pose.position.x, y=pose.pose.position.y, yaw=float(data.get('yaw', 0)))
@@ -312,6 +322,9 @@ class NavigationRuntime:
             else:
                 goal.goal = pose
                 goal.planner_id = 'GridBased'
+                if start is not None:
+                    goal.start = self.pose_message(start)
+                    goal.use_start = True
             self.navigating = not preview
             self.last_command = None
             def accepted(future):
@@ -335,14 +348,45 @@ class NavigationRuntime:
                                         raise ValueError('任务未完成：无可行路径、受阻或已取消')
                                     if preview:
                                         self.path = [[p.pose.position.x, p.pose.position.y] for p in result.result.path.poses]
-                                    self.cancel('路径预览完成，未驱动车轮' if preview else '已到达目标')
+                                    path = list(self.path)
+                                    self.cancel('路径预览完成，未驱动车轮' if preview else '已到达目标', keep_route=on_result is not None)
                                     self.status = 'ready'
+                                    if on_result is not None:
+                                        on_result(path, None)
                                 except Exception as e:
-                                    self.cancel(str(e), disarm=not preview)
+                                    self.cancel(str(e), disarm=not preview, keep_route=on_result is not None)
+                                    if on_result is not None:
+                                        on_result(None, str(e))
                         handle.get_result_async().add_done_callback(finished)
                     except Exception as e:
-                        self.cancel(str(e), disarm=not preview)
-            client.send_goal_async(goal).add_done_callback(accepted)
+                        self.cancel(str(e), disarm=not preview, keep_route=on_result is not None)
+                        if on_result is not None:
+                            on_result(None, str(e))
+            try:
+                client.send_goal_async(goal).add_done_callback(accepted)
+            except Exception as e:
+                self.cancel(str(e), disarm=not preview, keep_route=on_result is not None)
+                if on_result is not None:
+                    on_result(None, str(e))
+                else:
+                    raise
+
+    def preview_patrol(self, data, sid):
+        with self.lock:
+            task = validate_task(data)
+            if task['map'] != self.active_map:
+                raise ValueError('任务绑定的地图与当前定位地图不同，请先加载对应地图')
+            if self.pending or self.navigating:
+                raise ValueError('已有导航或预览任务，请先取消')
+            if not self.localized(time.monotonic()):
+                raise ValueError('请先设置初始位置，并等待定位稳定')
+            for i, p in enumerate(task['waypoints']):
+                try:
+                    self.check_goal(self.pose_message(p))
+                except ValueError as e:
+                    raise ValueError(f'第 {i+1} 个巡检点无效：{e}') from e
+            self.route_preview.start(task, dict(self.last_pose),
+                lambda start, target, done: self.send_goal(target, sid, preview=True, start=start, on_result=done))
 
     def start(self, name):
         with self.lock:
@@ -368,6 +412,7 @@ class NavigationRuntime:
         with self.lock:
             self.last_pose = self.last_amcl = None
             self.path = []
+            self.route_preview.clear()
             self.goal = None
             self.pose_ok = False
             self.lifecycle.clear()
@@ -399,6 +444,17 @@ class NavigationRuntime:
 
     def control(self, data, sid):
         action = data.get('action')
+        if action == 'patrol_save':
+            task = self.patrols.save(data.get('task'))
+            self.socketio.emit('patrol_loaded', task, to=sid)
+            self.note = '巡检任务已保存，尚未执行'
+            return
+        if action == 'patrol_load':
+            self.socketio.emit('patrol_loaded', self.patrols.get(data.get('name')), to=sid)
+            return
+        if action == 'patrol_preview':
+            self.preview_patrol(data.get('task'), sid)
+            return
         if action == 'heartbeat':
             with self.lock:
                 if self.navigating and sid == self.nav_owner:

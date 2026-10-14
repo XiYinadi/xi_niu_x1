@@ -1423,7 +1423,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     font-size:12px; user-select:none;
   }
   #navigation-panel { position:absolute; left:10px; top:10px; z-index:7; max-width:min(360px,90%);
-    background:rgba(24,24,32,.94); border:1px solid var(--line); border-radius:10px; padding:8px; font-size:12px; }
+    background:rgba(24,24,32,.94); border:1px solid var(--line); border-radius:10px; padding:8px; font-size:12px; max-height:85%; overflow:auto; }
   #navigation-panel summary { cursor:pointer; }
   #navigation-panel .nav-row { display:flex; gap:5px; flex-wrap:wrap; margin-top:8px; }
   #navigation-panel input, #navigation-panel select { min-width:0; max-width:180px; padding:5px; }
@@ -1654,6 +1654,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div class="nav-row"><button class="btn" id="nav-initial" disabled>设置当前位置</button><button class="btn" id="nav-target" disabled>选择目标并预览</button></div>
         <div class="nav-row"><button class="btn" id="nav-go" disabled>开始导航</button><button class="btn" id="nav-cancel">取消导航</button></div>
         <div id="nav-status">等待连接；先保存地图，再加载定位</div><div id="nav-path"></div>
+        <details id="patrol-panel"><summary>巡检任务（配置与预览）</summary>
+          <div class="nav-row"><select id="patrol-list" aria-label="已保存巡检任务"></select><button class="btn" id="patrol-load">载入任务</button><button class="btn" id="patrol-new">新建</button></div>
+          <div class="nav-row"><input id="patrol-name" placeholder="任务英文名" maxlength="64"><button class="btn" id="patrol-save">保存任务</button></div>
+          <div class="nav-row"><label>循环 <input id="patrol-cycles" type="number" value="1" min="1" max="100" style="width:60px"> 次</label><label>新增点停留 <input id="patrol-dwell" type="number" value="5" min="0" max="3600" style="width:65px"> 秒</label></div>
+          <div class="nav-row"><button class="btn" id="patrol-add">地图上添加点</button><button class="btn" id="patrol-preview">预览巡检路线</button></div>
+          <div id="patrol-map"></div><ol id="patrol-points" style="max-height:180px;overflow:auto;padding-left:22px"></ol>
+          <div id="patrol-draft-status">尚未配置巡检点</div><div id="patrol-status">仅配置和路线预览，不执行巡检</div>
+        </details>
       </details>
       <div id="legend">
         <span class="lg"><i style="background:#999"></i>地图</span>
