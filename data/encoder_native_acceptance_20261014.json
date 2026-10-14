@@ -1,0 +1,47 @@
+{
+  "date": "2026-10-14",
+  "action": "user manually rotated right rear wheel only; left wheel stationary",
+  "native_gpio_v1": {
+    "elapsed_s": 348.32,
+    "lines": [
+      {
+        "name": "L_A",
+        "edges": 800,
+        "rising": 400,
+        "falling": 400,
+        "repeated_polarity": 4,
+        "nonmonotonic": 0,
+        "min_interval_ns": 700209
+      },
+      {
+        "name": "L_B",
+        "edges": 843,
+        "rising": 421,
+        "falling": 422,
+        "repeated_polarity": 1,
+        "nonmonotonic": 0,
+        "min_interval_ns": 545105
+      },
+      {
+        "name": "R_A",
+        "edges": 51509,
+        "rising": 25925,
+        "falling": 25584,
+        "repeated_polarity": 16103,
+        "nonmonotonic": 69,
+        "min_interval_ns": 6510
+      },
+      {
+        "name": "R_B",
+        "edges": 51873,
+        "rising": 26159,
+        "falling": 25714,
+        "repeated_polarity": 19053,
+        "nonmonotonic": 61,
+        "min_interval_ns": 7344
+      }
+    ]
+  },
+  "motors_enabled_by_test": false,
+  "interpretation": "Native reader reproduces inactive-side edges and repeated polarity/non-increasing timestamps. This is not solely a Python reader bottleneck. No conclusion yet distinguishing wiring, encoder signal, IRQ driver or kernel event queue loss. nonmonotonic includes equal timestamps; not necessarily backward time."
+}

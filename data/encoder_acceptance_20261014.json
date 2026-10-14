@@ -1,0 +1,37 @@
+{
+  "date": "2026-10-14",
+  "mode": "manual wheel rotation; no motor driver started",
+  "voltage": "user confirmed encoder A/B <=3.3V",
+  "lines": {
+    "L_A": 0,
+    "L_B": 12,
+    "R_A": 5,
+    "R_B": 1
+  },
+  "left_only_edges": {
+    "L_A": 58759,
+    "L_B": 77504,
+    "R_A": 1827,
+    "R_B": 2266
+  },
+  "right_only_edges": {
+    "L_A": 5986,
+    "L_B": 6007,
+    "R_A": 257412,
+    "R_B": 265059
+  },
+  "stationary_15s_edges": {
+    "L_A": 0,
+    "L_B": 0,
+    "R_A": 0,
+    "R_B": 0
+  },
+  "user_confirmation": "other wheel did not rotate",
+  "assessment": "Both A/B pairs respond predominantly to the expected wheel. Inactive side receives edges during the other wheel rotation. Do not enable wheel odometry or PID until source is identified. Edge counts are not quadrature displacement.",
+  "next_checks": [
+    "encoder model and CPR",
+    "encoder supply and shared ground",
+    "signal wiring and electrical interference",
+    "timestamp-ordered quadrature decoding and edge loss"
+  ]
+}
