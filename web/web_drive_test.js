@@ -181,6 +181,23 @@ ok('三个盘的准线类齐全 (joy-2d 要 axis-y+axis-x 两条都亮)',
    && /class="joy-pad axis-x" id="joy-steer"/.test(HTML)
    && /class="joy-pad axis-y axis-x" id="joy-2d"/.test(HTML));
 
+console.log('=== 0b. 车速档位与检测画面 ===');
+ok('默认低速，未恢复高速', els['gear-low']._attrs['aria-pressed'] === 'true');
+touch(P.thr,0,-1);ok('低速满前进输出 0.5',near(read().l,.5));release(P.thr);
+touch(P.thr,0,1);ok('低速满倒车输出 -0.5',near(read().l,-.5));release(P.thr);
+touch(P.steer,1,0);ok('低速保留全部转向',near(read().a,-1));release(P.steer);
+document_.fire('keydown',{key:'w',preventDefault(){}});ok('键盘同样限低速',near(read().l,.5));
+els['gear-high'].fire('click');ok('切高速立即清掉按键输入',read().l===0);
+document_.fire('keydown',{key:'w',repeat:true,preventDefault(){}});ok('长按重复事件不会恢复出力',read().l===0);
+document_.fire('keyup',{key:'w'});
+touch(P.thr,0,-1);ok('高速保留原满量程',near(read().l,1));
+els['gear-low'].fire('click');ok('切低速清掉正在按的摇杆',read().l===0);
+P.thr.fire('pointermove',{clientX:75,clientY:0,pointerId:1});ok('切档后旧指针不能恢复出力',read().l===0);
+release(P.thr);els['gear-high'].fire('click');
+ok('页面只有检测窗口', !HTML.includes('id="win-cam"') && HTML.includes('id="win-fire"'));
+emitted.length=0;handlers.connect.forEach(f=>f());
+ok('默认开启检测流，不请求重复原始画面',emitted.some(e=>e.ev==='fire_control'&&e.p.action==='start')&&!emitted.some(e=>e.ev==='camera_control'));
+
 console.log('=== 1. 默认模式 ===');
 ok('默认双杆: #drive 没有 mode-single', !drive.classList.contains('mode-single'));
 ok('默认双杆: 「双杆」点亮、「单杆」不亮',
@@ -736,7 +753,7 @@ ok('旧指针在隐藏后移动不能恢复输出', read().l === 0 && readGimbal
 ok('折叠状态和辅助说明同步', drive.classList.contains('collapsed') && collapse._attrs['aria-expanded'] === 'false');
 collapse.fire('click');
 ok('展开不会恢复旧指令', !drive.classList.contains('collapsed') && read().l === 0 && readGimbal().dx === 0 && collapse._attrs['aria-expanded'] === 'true');
-ok('折叠保留急停所在按钮栏', SRC.includes('#drive.collapsed > :not(#drive-head):not(#drive-btns) { display:none; }') && /id="drive-btns">[\s\S]*?id="btn-estop"/.test(HTML));
+ok('急停在固定顶栏，独立于可折叠驾驶区', HTML.indexOf('id="btn-estop"') > HTML.indexOf('id="status-bar"') && HTML.indexOf('id="btn-estop"') < HTML.indexOf('id="workspace"'));
 emitted.length = 0;
 els['btn-estop'].fire('click');
 ok('折叠后急停仍发出 estop', emitted.some(e => e.ev === 'motor_control' && e.p.action === 'estop'));

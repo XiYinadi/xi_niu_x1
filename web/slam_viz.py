@@ -233,6 +233,8 @@ class SlamVizNode(Node):
         # Shared state
         self._latest_map_msg = None
         self._latest_scan_xy = []
+        self._scan_stamp = None
+        self._scan_frame = "laser"
         self._map_dirty = False
         self._scan_count = 0    # /scan 变更序号(broadcast_loop 用它判「新一帧」)
 
@@ -308,6 +310,8 @@ class SlamVizNode(Node):
         xy = laser_scan_to_xy(msg)
         with self._lock:
             self._latest_scan_xy = xy
+            self._scan_stamp = msg.header.stamp
+            self._scan_frame = msg.header.frame_id
             self._scan_count += 1
             self._last_scan_t = time.monotonic()
 
@@ -330,7 +334,7 @@ class SlamVizNode(Node):
                 self._trajectory = self._trajectory[-TRAJ_MAX:]
             self._latest_pose = (x, y, yaw)
 
-    def full_trajectory(self) -> dict:
+    def full_trajectory(self, map_frame=True) -> dict:
         """整条轨迹,只给新连上来的客户端补历史用。
 
         **不动 `_traj_sent`** —— 那个游标只属于广播循环的增量语义。这里如果
@@ -339,12 +343,18 @@ class SlamVizNode(Node):
         with self._lock:
             if not self._trajectory:
                 return None
-            return {
+            history = {
                 "reset": True,          # 让客户端整体重建,而不是追加
                 "from": self._traj_total - len(self._trajectory),
                 "points": [c for pt in self._trajectory for c in pt],
                 "total": self._traj_total,
             }
+
+        if map_frame:
+            if _navigation is None:
+                return None
+            return _navigation.transform_snapshot({'trajectory': history}).get('trajectory')
+        return history
 
     def get_state_snapshot(self) -> dict:
         """Thread-safe snapshot. Returns dict with optional 'map' and 'scan' keys."""
@@ -361,6 +371,8 @@ class SlamVizNode(Node):
                 # Copy reference atomically
                 result["scan"] = {
                     "points": self._latest_scan_xy,
+                    "stamp": self._scan_stamp,
+                    "frame": self._scan_frame,
                     "count": len(self._latest_scan_xy) // 2,
                     "seq": self._scan_count,   # 变更序号:broadcast 用它判「新一帧」
                 }
@@ -418,6 +430,9 @@ class SlamVizNode(Node):
 
         if _navigation is not None:
             result = _navigation.transform_snapshot(result)
+        else:
+            for key in ('scan', 'pose', 'trajectory'):
+                result.pop(key, None)
         return result
 
 
@@ -1255,11 +1270,28 @@ def _on_log_clear():
 # ══════════════════════════════════════════════════════════════════════
 
 def _shutdown(signum, frame):
+    """SIGTERM/SIGINT → 必须真的退出。
+
+    2026-10-18 实测事故：旧实现里 _navigation.stop() / rclpy.shutdown() 任何一步
+    抛异常（典型："rcl_shutdown already called" / "Context must be initialized
+    before it can be shutdown"），后面的 sys.exit(0) 就永远执行不到 ——
+    进程变成僵尸：Flask 继续服务 5800，ROS 上下文已死，网页显示的是假状态；
+    更糟的是 SIGTERM 从此杀不掉它，systemd 重起的实例全卡在
+    "Address already in use"，服务 CrashLoop 而僵尸继续对外发旧数据。
+    ⇒ 三步各自 try/except，最后 os._exit(0) 让内核立刻收回进程和端口。
+    """
     log.info("Received signal %s, shutting down...", signum)
-    if _navigation is not None:
-        _navigation.stop()
-    rclpy.shutdown()
-    sys.exit(0)
+    try:
+        if _navigation is not None:
+            _navigation.stop()
+    except Exception:
+        log.exception("navigation.stop() failed during shutdown")
+    try:
+        rclpy.shutdown()
+    except Exception:
+        log.exception("rclpy.shutdown() failed during shutdown")
+    log.info("shutdown complete — exiting")
+    os._exit(0)
 
 
 def main():
@@ -1332,10 +1364,16 @@ def main():
         socketio.run(app, host="0.0.0.0", port=PORT)
     finally:
         log.info("Cleaning up...")
-        if _navigation is not None:
-            _navigation.stop()
-        _ros_node.destroy_node()
-        rclpy.shutdown()
+        try:
+            if _navigation is not None:
+                _navigation.stop()
+        except Exception:
+            log.exception("navigation.stop() failed during cleanup")
+        try:
+            _ros_node.destroy_node()
+            rclpy.shutdown()
+        except Exception:
+            log.exception("ROS cleanup failed")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1347,7 +1385,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>犀牛派 SLAM 控制台</title>
+<title>犀牛一号 · 控制台</title>
 <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <style>
   :root {
@@ -1650,82 +1688,83 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     0%, 100% { opacity:1; }
     50%      { opacity:.55; }
   }
+
+/* Task-focused console: viewing on the left, controls on the right. */
+:root { --bg:#10191e; --bg-2:#132128; --accent:#77d5bd; --accent-soft:#23463f; --dim:#9aafb5; --line:#2b3d45; --radius:16px; }
+body { background:#10191e; }
+#status-bar { height:64px; gap:18px; padding:0 24px; background:#142128; font-size:12px; }
+.brand { font-size:19px; color:#edf5f3; white-space:nowrap; }.brand small { font-size:12px; color:var(--dim); font-weight:400; margin-left:10px; }
+#status-bar .hide-narrow,#status-bar span:has(>#s-fps) { display:none; }
+#btn-estop { flex:0 0 auto; font-size:15px; font-weight:700; padding:11px 24px; border-radius:10px; background:#792f39; color:#fff; border:1px solid #b85864; }
+#btn-estop:disabled { opacity:.5; cursor:not-allowed; }
+#workspace { top:64px; padding:18px; gap:14px; grid-template-columns:minmax(0,1fr) minmax(0,1fr) 370px; grid-template-rows:minmax(260px,1fr) minmax(180px,.62fr) 42px; }
+#win-map { grid-column:1 / span 2; grid-row:1; }#win-cam { grid-column:1; grid-row:2; }#win-fire { grid-column:2; grid-row:2; }#win-log { grid-column:1 / span 2; grid-row:3; }
+#win-map.full { inset:64px 0 0; }
+.win { background:#17262e; box-shadow:none; backdrop-filter:none; }
+.win-title { min-height:42px; padding:9px 14px; background:#1b2c34; }.win-title .t { font-size:13px; }.win-title .hud { font-size:11px; }
+#controls-panel { grid-column:3; grid-row:1 / span 3; overflow:auto; min-height:0; padding-right:4px; scrollbar-width:thin; scrollbar-color:#3c595f transparent; }
+.control-intro { padding:4px 4px 18px; }.eyebrow { color:var(--accent); font-size:11px; letter-spacing:2px; }.control-intro h2 { font-size:20px; margin:8px 0; font-weight:600; }.control-intro p,.task-help { color:var(--dim); font-size:12px; line-height:1.8; }
+#drive { position:static; padding:16px; background:#17262e; backdrop-filter:none; box-shadow:none; gap:12px; margin-bottom:14px; }
+#drive-title { color:var(--fg); font-size:15px; }#drive-head { gap:8px; }#btn-arm { padding:12px; border-radius:10px; background:#24483f; color:#acebd8; font-size:14px; }#btn-arm.armed { background:#77d5bd; color:#10201c; }
+#drive-hint,#gimbal-hint { white-space:normal; line-height:1.6; }#gimbal { padding-top:14px; }#gimbal-title { font-size:12px; }
+#navigation-panel { position:static; max-width:none; max-height:none; overflow:visible; padding:0; border:0; background:none; }
+.task-group,.task-state { border:1px solid var(--line); background:#17262e; border-radius:14px; margin-bottom:12px; padding:14px; }
+.task-group>summary { font-size:14px; font-weight:600; padding:3px 0; }.step { color:var(--accent); margin:0 8px; font-size:12px; font-variant-numeric:tabular-nums; }
+.task-group[open]>.task-help { margin:12px 0; }.task-editor,#autonomy-panel { border-top:1px solid var(--line); padding-top:12px; margin-top:14px; color:var(--dim); }
+#navigation-panel .nav-row { gap:8px; margin-top:12px; }#navigation-panel .btn,#btn-map { border-radius:8px; background:#263b44; color:#e0eeeb; padding:10px 12px; font-size:12px; line-height:1.4; }
+#navigation-panel .btn:disabled { opacity:.38; }#navigation-panel input,#navigation-panel select { background:#101e25; color:#e0eeeb; border:1px solid #3b535c; border-radius:7px; padding:9px; max-width:100%; font:inherit; }
+#nav-map,#patrol-list { width:100%; }#nav-name,#patrol-name { flex:1; width:140px; }#nav-go,#auto-patrol { background:#285547!important; }#nav-cancel,#auto-stop { color:#ffc4bb!important; }
+#nav-status,#auto-status,#patrol-status,#patrol-draft-status,#nav-path { font-size:12px; color:var(--dim); line-height:1.7; overflow-wrap:anywhere; }.task-state>strong { font-size:12px; }.report-link,#auto-report { display:inline-block; color:var(--accent); margin-top:14px; font-size:12px; }
+[hidden] { display:none!important; }#autonomy-alert { top:72px!important; }
+button:focus-visible,summary:focus-visible,a:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+@media(max-width:1100px) { #workspace { grid-template-columns:minmax(0,1fr) minmax(0,1fr) 340px; padding:10px; gap:10px; }#drive { padding:12px; }.joy-pad { width:140px; height:140px; }#status-bar { padding:0 16px; gap:12px; }#s-clock { display:none; } }
+@media(max-width:760px) { body { overflow:auto; }#status-bar { height:60px; padding:0 12px; gap:10px; }.brand { font-size:16px; }.brand small,#status-bar span:has(>#s-scan),#status-bar span:has(>#s-fire) { display:none; }#btn-estop { margin-left:auto; padding:9px 16px; }#workspace { position:relative; top:auto; margin-top:60px; display:flex; flex-direction:column; padding:10px; }#win-map { order:0; height:48vh; min-height:300px; flex:none; }#controls-panel { order:1; overflow:visible; padding:0; }.control-intro { padding:14px 4px; }#win-cam { order:2; }#win-fire { order:3; }#win-log { order:4; }#win-cam,#win-fire { height:240px; flex:none; }#win-log { height:200px; flex:none; }#win-log.collapsed,#win-cam.collapsed,#win-fire.collapsed { height:42px; }#win-map.full { inset:60px 0 0; height:auto; }.joy-pad { width:140px; height:140px; }#hud { display:none; } }
+
+
+#drive.collapsed #joy-mode { display:none; }
+#drive.collapsed { gap:0; }#drive.collapsed #drive-btns { display:none; }
+#map-empty { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; pointer-events:none; text-align:center; color:#81959e; padding:24px; }
+#map-empty strong { font-size:18px; font-weight:500; color:#c7d9dd; }#map-empty span { font-size:13px; line-height:1.9; }
+
+#win-fire { grid-column:1 / span 2; }
+#speed-gears { display:flex; align-items:center; gap:8px; }#speed-gears span { margin-right:auto; color:var(--dim); }
+#speed-gears button { background:#253b44; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:8px 22px; cursor:pointer; }
+#speed-gears button.on { background:var(--accent); color:#10201c; }#gear-hint { color:var(--dim); font-size:12px; line-height:1.6; }
 </style>
 </head>
 <body>
 
 <div id="status-bar">
-  <a href="/inspection" target="_blank" rel="noopener" style="color:var(--accent);white-space:nowrap">巡检工作台 ↗</a>
-  <span id="status-conn"><span id="conn-dot"></span><span id="conn-text">Disconnected</span></span>
-  <span class="hide-narrow"><span class="stat-label">Map</span><span id="s-map">—</span></span>
-  <span><span class="stat-label">Scan</span><span id="s-scan">—</span></span>
-  <span class="hide-narrow"><span class="stat-label">Path</span><span id="s-trajectory">0</span></span>
-  <span><span class="stat-label">FPS</span><span id="s-fps">0</span></span>
-  <span><span class="stat-label">Fire</span><span id="s-fire">—</span></span>
+  <strong class="brand">犀牛一号 <small>控制台</small></strong>
+  <span id="status-conn"><span id="conn-dot"></span><span id="conn-text">未连接</span></span>
+  <span class="hide-narrow"><span class="stat-label">环境地图</span><span id="s-map">—</span></span>
+  <span><span class="stat-label">雷达</span><span id="s-scan">—</span></span>
+  <span class="hide-narrow"><span class="stat-label">轨迹</span><span id="s-trajectory">0</span></span>
+  <span><span class="stat-label">帧率</span><span id="s-fps">0</span></span>
+  <span><span class="stat-label">火情检测</span><span id="s-fire">—</span></span>
   <span class="spacer"></span>
   <span id="s-clock">--:--:--</span>
+          <button id="btn-estop" disabled>急停</button>
 </div>
 <div id="autonomy-alert" hidden role="alert" style="position:fixed;top:48px;left:10%;right:10%;z-index:100;background:#642522;border:2px solid #f48772;border-radius:8px;padding:16px;color:#fff;white-space:normal"><span id="autonomy-alert-message"></span> <a id="autonomy-alert-evidence" hidden target="_blank" rel="noopener" style="text-decoration:underline">查看现场证据 ↗</a></div>
 
 <div id="workspace">
-
-  <section class="win" id="win-map">
-    <header class="win-title">
-      <span class="t">Map</span>
-      <span class="hud" id="hud">x:— y:— θ:—</span>
-      <span class="grp">
-        <button id="btn-map" disabled>建图</button>
-        <button class="btn" id="btn-follow" title="跟随机器人">◉</button>
-        <button class="btn" id="btn-zoomout" title="缩小">−</button>
-        <button class="btn" id="btn-zoomin" title="放大">+</button>
-        <button class="btn" id="btn-reset" title="复位视图">⌂</button>
-        <button class="btn" id="btn-full" title="最大化/还原地图">⛶</button>
-      </span>
-    </header>
-    <div class="win-body" id="map-body">
-      <canvas id="c"></canvas>
-      <details id="navigation-panel"><summary>地图与导航</summary>
-        <details id="autonomy-panel" open><summary>自动建图与巡检</summary>
-          <div class="nav-row"><button class="btn" id="auto-prepare">准备自动建图</button><button class="btn" id="auto-preview">查看探索目标</button></div>
-          <div class="nav-row"><button class="btn" id="auto-explore" disabled>开始自动建图</button><button class="btn" id="auto-finish" disabled>结束建图并保存</button></div>
-          <div class="nav-row"><button class="btn" id="auto-patrol" disabled>执行所选巡检任务</button><button class="btn" id="auto-stop">停止自动任务</button><button class="btn" id="auto-ack" disabled>已人工确认告警</button></div>
-          <div id="auto-status" style="white-space:normal;line-height:1.6;margin-top:8px">等待连接；发现疑似火情即停车上报</div>
-          <a id="auto-report" hidden target="_blank" rel="noopener">查看本次巡检报告 ↗</a>
-        </details>
-        <div class="nav-row"><input id="nav-name" placeholder="地图英文名" maxlength="64"><button class="btn" id="nav-save">保存当前地图</button></div>
-        <div class="nav-row"><select id="nav-map" aria-label="已保存地图"></select><button class="btn" id="nav-load">加载定位</button><button class="btn" id="nav-stop" disabled>停止定位</button></div>
-        <div class="nav-row"><button class="btn" id="nav-initial" disabled>设置当前位置</button><button class="btn" id="nav-target" disabled>选择目标并预览</button></div>
-        <div class="nav-row"><button class="btn" id="nav-go" disabled>开始导航</button><button class="btn" id="nav-cancel">取消导航</button></div>
-        <div id="nav-status">等待连接；先保存地图，再加载定位</div><div id="nav-path"></div>
-        <details id="patrol-panel"><summary>巡检任务（配置与预览）</summary>
-          <div class="nav-row"><select id="patrol-list" aria-label="已保存巡检任务"></select><button class="btn" id="patrol-load">载入任务</button><button class="btn" id="patrol-new">新建</button></div>
-          <div class="nav-row"><input id="patrol-name" placeholder="任务英文名" maxlength="64"><button class="btn" id="patrol-save">保存任务</button></div>
-          <div class="nav-row"><label>循环 <input id="patrol-cycles" type="number" value="1" min="1" max="100" style="width:60px"> 次</label><label>新增点停留 <input id="patrol-dwell" type="number" value="5" min="0" max="3600" style="width:65px"> 秒</label></div>
-          <div class="nav-row"><button class="btn" id="patrol-add">地图上添加点</button><button class="btn" id="patrol-preview">预览巡检路线</button></div>
-          <div id="patrol-map"></div><ol id="patrol-points" style="max-height:180px;overflow:auto;padding-left:22px"></ol>
-          <div id="patrol-draft-status">尚未配置巡检点</div><div id="patrol-status">仅配置和路线预览，不执行巡检</div>
-        </details>
-      </details>
-      <div id="legend">
-        <span class="lg"><i style="background:#999"></i>地图</span>
-        <span class="lg"><i style="background:#00d2ff"></i>&lt;1m</span>
-        <span class="lg"><i style="background:#7bed9f"></i>1–3m</span>
-        <span class="lg"><i style="background:#ffa502"></i>&gt;3m</span>
-      </div>
-      <div id="drive">
+<aside id="controls-panel" aria-label="机器人操作"><div class="control-intro"><span class="eyebrow">操作面板</span><h2>今天想让小犀做什么？</h2><p>手动驾驶，或按步骤建图、导航与巡检。</p></div>      <div id="drive" class="collapsed">
         <div id="drive-head">
-          <div id="drive-title">Drive</div>
+          <div id="drive-title">手动驾驶</div>
           <div id="drive-head-right">
             <div id="joy-mode" role="group" aria-label="摇杆模式">
               <button type="button" data-mode="dual" title="左杆油门 / 右杆转向;两轴独立,可同时满舵">双杆</button>
               <button type="button" data-mode="single" title="一个盘同时给油门与转向;圆门,斜推时两轴各占一部分">单杆</button>
             </div>
-            <button class="btn" id="btn-drive-collapse" aria-expanded="true" title="折叠/展开驾驶面板">—</button>
+            <button class="btn" id="btn-drive-collapse" aria-expanded="false" title="折叠/展开驾驶面板">展开</button>
           </div>
         </div>
+        <p class="task-help">先启用电机，再按住摇杆驾驶。松手即停止。</p>
+        <div id="speed-gears" role="group" aria-label="车速档位"><span>车速档位</span><button type="button" id="gear-low" aria-pressed="true">低速</button><button type="button" id="gear-high" aria-pressed="false">高速</button></div><div id="gear-hint">低速 · 油门上限 50%</div>
         <div id="drive-btns">
           <button id="btn-arm" disabled>启用电机</button>
-          <button id="btn-estop" disabled>急停</button>
+
         </div>
         <div id="joy-pair">
           <div class="joy-wrap">
@@ -1745,7 +1784,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <div id="drive-hint">左杆油门 右杆转向,或 WASD/方向键</div>
         <div id="gimbal" class="mode-single">
           <div id="gimbal-head">
-            <div id="gimbal-title">Gimbal 相机云台</div>
+            <div id="gimbal-title">调整相机方向</div>
             <div id="gimbal-mode" role="group" aria-label="云台摇杆模式">
               <button type="button" data-mode="dual" title="水平 pan / 垂直 tilt;两轴独立,可同时满量程">双杆</button>
               <button type="button" data-mode="single" title="一个盘同时给 pan+tilt;圆门">单杆</button>
@@ -1754,11 +1793,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div id="gimbal-pair">
             <div class="joy-wrap">
               <div class="joy-pad axis-x" id="joy-gimbal-pan"><div class="joy-knob" id="knob-gimbal-pan"></div></div>
-              <div class="joy-lab">pan ←左 →右</div>
+              <div class="joy-lab">水平 ←左 →右</div>
             </div>
             <div class="joy-wrap">
               <div class="joy-pad axis-y" id="joy-gimbal-tilt"><div class="joy-knob" id="knob-gimbal-tilt"></div></div>
-              <div class="joy-lab">tilt ↑上 ↓下</div>
+              <div class="joy-lab">垂直 ↑上 ↓下</div>
             </div>
           </div>
           <div id="gimbal-single">
@@ -1768,27 +1807,62 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div id="gimbal-val">dx +0　dy +0</div>
           <div id="gimbal-hint">云台:不必「启用电机」</div>
         </div>
-      </div>
-    </div>
-  </section>
+      </div><div id="navigation-panel">
+<details class="task-group"><summary><span class="step">01</span> 建立地图</summary>
+<p class="task-help">第一次使用：启动建图，用上方摇杆缓慢移动，完成后保存地图。</p>
+<div class="nav-row"><button id="btn-map" disabled>建图</button></div>
+<div class="nav-row"><input id="nav-name" placeholder="地图英文名" maxlength="64"><button class="btn" id="nav-save">保存当前地图</button></div>
+<details id="autonomy-panel"><summary>自动建图（需完成实车标定）</summary>
+<p class="task-help">准备 → 查看探索目标 → 开始；未完成标定时不能自动行驶。</p>
+<div class="nav-row"><button class="btn" id="auto-prepare">准备自动建图</button><button class="btn" id="auto-preview">查看探索目标</button></div><div class="nav-row"><button class="btn" id="auto-explore" disabled>开始自动建图</button><button class="btn" id="auto-finish" disabled>结束建图并保存</button></div>
+</details></details>
+<details class="task-group"><summary><span class="step">02</span> 定位与导航</summary>
+<p class="task-help">① 选地图并加载定位　② 在地图设置真实位置和朝向　③ 选择目标，预览后再开始导航。</p>
+<div class="nav-row"><select id="nav-map" aria-label="已保存地图"></select><button class="btn" id="nav-load">加载定位</button><button class="btn" id="nav-stop" disabled>停止定位</button></div><div class="nav-row"><button class="btn" id="nav-initial" disabled>设置当前位置</button><button class="btn" id="nav-target" disabled>选择目标并预览</button></div><div class="nav-row"><button class="btn" id="nav-go" disabled>开始导航</button><button class="btn" id="nav-cancel">取消导航</button></div>
+</details>
+<details class="task-group" id="patrol-panel"><summary><span class="step">03</span> 巡检任务</summary>
+<p class="task-help">先完成定位，再选择任务。新任务需添加巡检点并保存；预览路线后再执行。</p>
+<div class="nav-row"><select id="patrol-list" aria-label="已保存巡检任务"></select><button class="btn" id="patrol-load">载入任务</button><button class="btn" id="patrol-new">新建</button></div>
+<details class="task-editor"><summary>新建 / 编辑巡检点</summary>
+<div class="nav-row"><input id="patrol-name" placeholder="任务英文名" maxlength="64"><button class="btn" id="patrol-save">保存任务</button></div><div class="nav-row"><label>循环 <input id="patrol-cycles" type="number" value="1" min="1" max="100" style="width:60px"> 次</label><label>新增点停留 <input id="patrol-dwell" type="number" value="5" min="0" max="3600" style="width:65px"> 秒</label></div><div class="nav-row"><button class="btn" id="patrol-add">地图上添加点</button><button class="btn" id="patrol-preview">预览巡检路线</button></div><div id="patrol-map"></div><ol id="patrol-points" style="max-height:180px;overflow:auto;padding-left:22px"></ol>
+</details>
+<div class="nav-row"><button class="btn" id="auto-patrol" disabled>执行所选巡检任务</button></div>
+<div id="patrol-draft-status">尚未配置巡检点</div><div id="patrol-status">仅配置和路线预览，不执行巡检</div>
+<a href="/inspection" target="_blank" rel="noopener" class="report-link">查看巡检记录与报告 ↗</a>
+</details>
+<div class="task-state"><strong>任务状态</strong>
+<div id="nav-status">等待连接；先保存地图，再加载定位</div><div id="nav-path"></div><div id="auto-status" style="white-space:normal;line-height:1.6;margin-top:8px">等待连接；发现疑似火情即停车上报</div>
+<div class="nav-row"><button class="btn" id="auto-stop">停止自动任务</button><button class="btn" id="auto-ack" disabled>已人工确认告警</button></div>
+<a id="auto-report" hidden target="_blank" rel="noopener">查看本次巡检报告 ↗</a>
+</div></div></aside>
 
-  <section class="win" id="win-cam">
+  <section class="win" id="win-map">
     <header class="win-title">
-      <span class="t">Camera</span>
-      <span class="sub" id="cam-info">—</span>
+      <span class="t">环境地图</span>
+      <span class="hud" id="hud">x:— y:— θ:—</span>
       <span class="grp">
-        <button class="btn" id="btn-cam-collapse" title="折叠/展开相机">—</button>
+        <button class="btn" id="btn-follow" title="跟随机器人">◉</button>
+        <button class="btn" id="btn-zoomout" title="缩小">−</button>
+        <button class="btn" id="btn-zoomin" title="放大">+</button>
+        <button class="btn" id="btn-reset" title="复位视图">⌂</button>
+        <button class="btn" id="btn-full" title="最大化/还原地图">⛶</button>
       </span>
     </header>
-    <div class="win-body" id="cam-body">
-      <img id="cam-img" alt="camera" />
-      <div id="cam-err" style="display:none;">相机离线</div>
+    <div class="win-body" id="map-body">
+      <canvas id="c"></canvas><div id="map-empty"><strong>等待地图数据</strong><span>首次使用，请展开“建立地图”启动建图。<br>已有地图，请在“定位与导航”中加载。</span></div>
+      <div id="legend">
+        <span class="lg"><i style="background:#999"></i>地图</span>
+        <span class="lg"><i style="background:#00d2ff"></i>&lt;1m</span>
+        <span class="lg"><i style="background:#7bed9f"></i>1–3m</span>
+        <span class="lg"><i style="background:#ffa502"></i>&gt;3m</span>
+      </div>
+
     </div>
   </section>
 
   <section class="win" id="win-fire">
     <header class="win-title">
-      <span class="t">Fire</span>
+      <span class="t">现场检测画面</span>
       <span class="hud off" id="fire-hud">—</span>
       <span class="sub" id="fire-info">—</span>
       <span class="grp">
@@ -1797,18 +1871,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </header>
     <div class="win-body" id="fire-body">
       <img id="fire-img" alt="fire" />
-      <div id="fire-err" style="display:none;">火情检测离线</div>
+      <div id="fire-err">等待检测画面</div>
     </div>
   </section>
 
-  <section class="win" id="win-log">
+  <section class="win collapsed" id="win-log">
     <header class="win-title">
-      <span class="t">Log</span>
+      <span class="t">运行日志</span>
       <span class="sub" id="log-count">0</span>
       <span class="grp">
         <button class="btn active" id="btn-log-scroll" title="自动滚动">⇓</button>
         <button class="btn" id="btn-log-clear" title="清空">✕</button>
-        <button class="btn" id="btn-log-collapse" title="折叠/展开日志">—</button>
+        <button class="btn" id="btn-log-collapse" title="折叠/展开日志">展开</button>
       </span>
     </header>
     <div class="win-body" id="log-body">
@@ -1857,15 +1931,14 @@ const connText = document.getElementById('conn-text');
 
 socket.on('connect', () => {
   connDot.className = 'live';
-  connText.textContent = 'Live';
-  // 相机 + 火情窗口默认开启
-  socket.emit('camera_control', { action: 'start' });
+  connText.textContent = '已连接';
+  // 只开启检测画面，避免重复传输原始相机流
   socket.emit('fire_control', { action: 'start' });
 });
 
 socket.on('disconnect', () => {
   connDot.className = '';
-  connText.textContent = 'Disconnected';
+  connText.textContent = '未连接';
 });
 
 socket.on('map', data => {
@@ -1875,7 +1948,7 @@ socket.on('map', data => {
   document.getElementById('s-map').textContent =
     `${data.width}×${data.height} @ ${(data.resolution*100).toFixed(0)}cm`;
   const img = new Image();
-  img.onload = () => { mapImg = img; };
+  img.onload = () => { mapImg = img; document.getElementById('map-empty').hidden = true; };
   img.src = 'data:image/png;base64,' + data.png;
 });
 
@@ -1914,30 +1987,7 @@ socket.on('pose', d => {
     `x:${d.x.toFixed(2)} y:${d.y.toFixed(2)} θ:${deg}°`;
 });
 
-// ── 相机 ────────────────────────────────────────────────────────
-const camImg = document.getElementById('cam-img');
-const camInfo = document.getElementById('cam-info');
-const camErr = document.getElementById('cam-err');
-
-socket.on('frame', data => {
-  camImg.src = 'data:image/jpeg;base64,' + data.img;
-  camErr.style.display = 'none';
-  if (data.w) camInfo.textContent = `${data.w}×${data.h}`;
-});
-
-socket.on('camera_state', state => {
-  if (state.running) camInfo.textContent =
-    `${state.w ? state.w+'×'+state.h+' ' : ''}${state.fps ? state.fps.toFixed(1)+' fps' : ''}`.trim();
-  else if (state.error) camInfo.textContent = 'err';
-});
-
-document.getElementById('btn-cam-collapse').addEventListener('click', () => {
-  const collapsed = document.getElementById('win-cam').classList.toggle('collapsed');
-  updateGridClasses();
-  socket.emit('camera_control', { action: collapsed ? 'stop' : 'start' });
-});
-
-// ── 火情 ────────────────────────────────────────────────────────
+// ── 检测画面 ─────────────────────────────────────────────
 const fireImg = document.getElementById('fire-img');
 const fireHud = document.getElementById('fire-hud');
 const fireInfo = document.getElementById('fire-info');
@@ -2042,13 +2092,10 @@ document.getElementById('btn-log-collapse').addEventListener('click', () => {
 });
 
 function updateGridClasses() {
-  // 右列三行(相机/火情/日志):折叠的行缩成 auto,其余均分
-  const ws = document.getElementById('workspace');
-  const row = el => el.classList.contains('collapsed') ? 'auto' : 'minmax(0,1fr)';
-  ws.style.gridTemplateRows =
-    row(document.getElementById('win-cam')) + ' ' +
-    row(document.getElementById('win-fire')) + ' ' +
-    row(document.getElementById('win-log'));
+  const collapsed = document.getElementById('win-log').classList.contains('collapsed');
+  document.getElementById('workspace').style.gridTemplateRows =
+    'minmax(260px,1fr) minmax(180px,.62fr) ' + (collapsed ? '42px' : '180px');
+  document.getElementById('btn-log-collapse').textContent = collapsed ? '展开' : '收起';
 }
 
 // ── 驾驶 (电机控制) ──────────────────────────────────────────────
@@ -2224,7 +2271,7 @@ document.getElementById('btn-drive-collapse').addEventListener('click', () => {
   if (collapsed) releaseAll();
   panel.classList.toggle('collapsed', collapsed);
   const button = document.getElementById('btn-drive-collapse');
-  button.textContent = collapsed ? '+' : '—';
+  button.textContent = collapsed ? '展开' : '收起';
   button.setAttribute('aria-expanded', String(!collapsed));
 });
 
@@ -2433,6 +2480,24 @@ try {
 // 初始化按钮高亮(没走到上面那行时也要把「双杆」点亮)。
 for (const b of modeBtns) b.classList.toggle('on', b.dataset.mode === joyMode);
 
+// Manual throttle range only; each page starts low, never restores high speed.
+let speedGear = 'low';
+function setSpeedGear(gear) {
+  const next = gear === 'high' ? 'high' : 'low';
+  if (next !== speedGear) releaseAll();
+  speedGear = next;
+  for (const [id, value] of [['gear-low','low'], ['gear-high','high']]) {
+    const button = document.getElementById(id);
+    button.classList.toggle('on', speedGear === value);
+    button.setAttribute('aria-pressed', String(speedGear === value));
+  }
+  document.getElementById('gear-hint').textContent = speedGear === 'low'
+    ? '低速 · 油门上限 50% · 适合建图' : '高速 · 原有油门范围 · 注意周围环境';
+}
+document.getElementById('gear-low').addEventListener('click', () => setSpeedGear('low'));
+document.getElementById('gear-high').addEventListener('click', () => setSpeedGear('high'));
+setSpeedGear('low');
+
 // ── 云台摇杆模式切换 (双杆 / 单杆) ──────────────────────────────
 // 和 setJoyMode 同一套顺序:先清正在按的盘、再切 class(隐藏一个正持着 pointer
 // capture 的元素时 pointerup 不保证送到它,盘藏了但残留 active 会继续发)。
@@ -2483,7 +2548,7 @@ function driveTarget() {
   if (keys['a'] || keys['ArrowLeft']) a += 1;
   if (keys['d'] || keys['ArrowRight']) a -= 1;
   return {
-    l: Math.max(-1, Math.min(1, l)),
+    l: Math.max(-1, Math.min(1, l)) * (speedGear === 'low' ? 0.5 : 1),
     a: Math.max(-1, Math.min(1, a)),
   };
 }
