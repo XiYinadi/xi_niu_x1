@@ -200,10 +200,9 @@ class LaserOdomNode(Node):
 
         self.prev_points = cur_points.copy()
 
-        # Publish TF and odometry with NOW timestamp to avoid
-        # TF lookup race: rviz2 may receive /scan before the TF
-        # arrives when both share the scan's timestamp.
-        self._publish_tf(self.get_clock().now().to_msg())
+        # The estimated pose belongs to this scan, not its delayed arrival time.
+        # Using wall-clock NOW shifts the odometry relative to moving laser data.
+        self._publish_tf(scan_msg.header.stamp)
 
         # Periodic status
         if self.scan_count % 100 == 0:

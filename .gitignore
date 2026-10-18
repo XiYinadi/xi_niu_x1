@@ -27,3 +27,8 @@ data/patrols/
 data/inspections/
 
 data/autonomy/
+
+# 编译产物 / 临时文件（2026-10-18）
+slam/encoder_sampler
+web/slam_viz.py.bak-*
+*.tmp-patch

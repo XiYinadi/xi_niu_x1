@@ -6,7 +6,7 @@
 # 给网页地图窗口那个「启动建图」按钮用,也可以直接 ssh 跑。
 #
 # 只碰这 4 个进程,别的都不碰:
-#   rplidar_node / laser_odom.py / static_transform_publisher / async_slam_toolbox_node
+#   rplidar_node / wheel_odom.py / static_transform_publisher / async_slam_toolbox_node
 #
 # ⚠️ 为什么不复用 start_slam.sh:
 #   ① 它 `pkill -f slam_viz` —— 会杀掉正在提供这个按钮的网页服务;
@@ -17,28 +17,29 @@
 #   的脚本上。所以这里是独立一份,不是 start_slam.sh 的开关。
 #
 # ⚠️⚠️ 本脚本自己绝不能出现在任何 pkill -f 的模式里 —— 命令行里带那个字符串的 shell
-#   会把自己杀掉(exit 255)。所以 laser_odom 用带括号的 `laser_odom[.]py` 写法,
+#   会把自己杀掉(exit 255)。所以 wheel_odom 用带括号的 `wheel_odom[.]py` 写法,
 #   和本仓库既有的 `slam_viz[.]py` 约定一致。加新模式前先想一遍这件事。
 #
 # 退出码:
 #   0  成功
 #   2  雷达设备不存在(重启后需重新插拔 USB)
-#   3  motor_driver 在跑(会和 laser_odom 抢 odom→base_link TF)
+#   3  motor_driver 在跑(会和 wheel_odom 抢 odom→base_link TF)
 #   4  用法错
 #   5  source ROS 环境失败
 #   6  定位导航正在运行，必须先停止
+#   7  编码器未标定或采样器缺失
 
 set -u
 
 LIDAR_DEV="${LIDAR_DEV:-/dev/ttyUSB0}"    # 可覆盖:为了能在不拔硬件的情况下故意测失败路径
 LIDAR_LOG=/tmp/lidar.log
-ODOM_LOG=/tmp/laser_odom.log
+ODOM_LOG=/tmp/laser_odom.log  # Legacy log filename retained for the deployed web tailer
 TF_LOG=/tmp/tf_laser.log
 SLAM_LOG=/tmp/slam.log
 
 # 这 4 个文件必须和 slam_viz.py 的 LOG_FILES 一致 —— 网页日志窗口 tail 的就是它们,
 # 换名字不会报错,只会让日志窗口安静下来。
-PROCS=(rplidar_node laser_odom static_transform_publisher async_slam_toolbox_node)
+PROCS=(rplidar_node wheel_odom static_transform_publisher async_slam_toolbox_node)
 
 usage() {
     echo "用法: bash $0 start|stop|status" >&2
@@ -66,7 +67,7 @@ do_stop() {
     # 顺序:先断**产出**(SLAM),再断输入 —— 反过来会让 SLAM 在最后几秒刷
     # "Failed to compute odom pose" 之类的噪声,看着像出错其实只是顺序问题。
     local leftover=0
-    for pat in async_slam_toolbox_node static_transform_publisher 'laser_odom[.]py' rplidar_node; do
+    for pat in async_slam_toolbox_node static_transform_publisher 'wheel_odom[.]py' 'laser_odom[.]py' rplidar_node; do
         if running "$pat"; then
             kill_wait "$pat" || leftover=$((leftover + 1))
             echo "  已停 $pat"
@@ -95,17 +96,21 @@ do_start() {
         echo "❌ 雷达设备 $LIDAR_DEV 不存在 —— 设备重启后需要重新插拔 RPLidar 的 USB"
         return 2
     fi
-    # motor_driver 与 laser_odom **都**发 odom→base_link TF。两个发布者同时存在时
+    # motor_driver 与 wheel_odom **都**发 odom→base_link TF。两个发布者同时存在时
     # slam_toolbox 的 TF 查询会随机取到其中一个,地图会莫名其妙地抖/飘,而日志上
     # 只是偶发的 TF 警告 —— 所以这里宁可不起,也不要起一个「看着在跑」的坏组合。
     if running 'motor_driver[.]py'; then
-        echo "❌ motor_driver.py 正在跑,它和 laser_odom 会同时发布 odom→base_link TF"
+        echo "❌ motor_driver.py 正在跑,它和 wheel_odom 会同时发布 odom→base_link TF"
         echo "   两者不能并存。先 bash ~/start_pwm.sh(它会停掉 motor_driver 把 GPIO 让给 pwm_proc)"
         return 3
     fi
 
+    # Fail before touching the existing map when encoder calibration is missing.
+    /usr/bin/python3 "$HOME/robot/slam/wheel_odom.py" --check || return 7
+    [ -x "$HOME/robot/slam/encoder_sampler" ] || { echo "编码器采样器未安装"; return 7; }
+
     # ── 清残留(幂等)────────────────────────────────────────
-    do_stop >/dev/null 2>&1
+    do_stop >/dev/null 2>&1 || return 1
 
     # ── 环境:自己 source,不依赖调用者 ───────────────────────
     # ⚠️⚠️ 必须临时关掉 `set -u`:ROS 的 setup.bash 会引用**未定义的**变量
@@ -133,14 +138,10 @@ do_start() {
     setsid nohup ros2 launch rplidar_ros rplidar_a1_launch.py > "$LIDAR_LOG" 2>&1 < /dev/null &
     echo "  → 雷达     $LIDAR_DEV            日志 $LIDAR_LOG"
 
-    # ⚠️ `-p base_frame:=base_link` 是**承重的**,不是可选参数。
-    #    它的默认值是 base_footprint,而静态 TF 发的是 base_link→laser、YAML 里
-    #    写的是 base_frame: base_link。不加这个覆盖,TF 树会裂成两截
-    #    (odom→base_footprint 孤悬 + base_link 无父),slam_toolbox 的 getOdomPose
-    #    全失败 ⇒ 地图全空,而日志上只表现为刷 "Failed to compute odom pose"。
-    setsid nohup python3 "$HOME/laser_odom.py" --ros-args -p base_frame:=base_link \
+    # Input-only encoder node publishes odom -> base_link; motor GPIO untouched.
+    setsid nohup python3 "$HOME/robot/slam/wheel_odom.py" --params "$HOME/robot/slam/wheel_odom.yaml" \
         > "$ODOM_LOG" 2>&1 < /dev/null &
-    echo "  → 激光里程计(ICP)                日志 $ODOM_LOG"
+    echo "  → 编码器里程计                日志 $ODOM_LOG"
 
     setsid nohup ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 base_link laser \
         > "$TF_LOG" 2>&1 < /dev/null &
@@ -164,7 +165,7 @@ do_start() {
     local alive=0 tries=0
     while [ "$tries" -lt 12 ]; do
         alive=0
-        for pat in rplidar_node 'laser_odom[.]py' static_transform_publisher async_slam_toolbox_node; do
+        for pat in rplidar_node 'wheel_odom[.]py' static_transform_publisher async_slam_toolbox_node; do
             if running "$pat"; then alive=$((alive + 1)); fi
         done
         [ "$alive" -ge 4 ] && break
@@ -175,7 +176,11 @@ do_start() {
     # 只有**一个都没起来**才算脚本失败。差一个不当失败:上面的过滤按进程名匹配,
     # 而真正的判据是 /scan 与 /map 的数据流(可能少一个照样在出图,也可能四个
     # 全在却因为雷达没插而不出图)。
-    [ "$alive" -gt 0 ] || return 1
+    if [ "$alive" -lt 4 ]; then
+        tail -n 8 "$ODOM_LOG"
+        do_stop
+        return 1
+    fi
     return 0
 }
 

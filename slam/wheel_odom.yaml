@@ -1,0 +1,13 @@
+# Encoder channels follow the existing pin 7/8 and pin 11/10 assignments.
+# 2026-10-18: user measured LEFT/RIGHT rear wheel centre spacing as 0.30 m.
+# Initial hand-turned one-revolution calibration: L=106188, R=102626; diameter 0.13m.
+# Ground trials slipped and are excluded. Right wheel was reportedly turned backward.
+# Provisional scale/direction: independent rolling distance validation still required.
+# This flag does NOT unlock autonomous navigation (separate calibration remains false).
+wheel_track_m: 0.30
+counts_per_meter_left: 260005.309185
+counts_per_meter_right: 251283.618304
+sign_left: 1
+sign_right: -1
+calibrated: true
+max_wheel_speed_mps: 0.5

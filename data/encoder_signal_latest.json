@@ -1,0 +1,44 @@
+{
+  "lines": [
+    {
+      "name": "L_A",
+      "edges": 1084,
+      "rising": 541,
+      "falling": 543,
+      "repeated_polarity": 9,
+      "wrong_source": 0,
+      "nonmonotonic": 0,
+      "min_interval_ns": 78021
+    },
+    {
+      "name": "L_B",
+      "edges": 1120,
+      "rising": 559,
+      "falling": 561,
+      "repeated_polarity": 1,
+      "wrong_source": 0,
+      "nonmonotonic": 0,
+      "min_interval_ns": 538229
+    },
+    {
+      "name": "R_A",
+      "edges": 70243,
+      "rising": 35232,
+      "falling": 35011,
+      "repeated_polarity": 26605,
+      "wrong_source": 0,
+      "nonmonotonic": 118,
+      "min_interval_ns": 6042
+    },
+    {
+      "name": "R_B",
+      "edges": 71402,
+      "rising": 35821,
+      "falling": 35581,
+      "repeated_polarity": 29354,
+      "wrong_source": 0,
+      "nonmonotonic": 97,
+      "min_interval_ns": 6094
+    }
+  ]
+}

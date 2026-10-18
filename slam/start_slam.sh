@@ -56,7 +56,7 @@ echo "✅ SLAM 建图已启动"
 
 # 5. Web 可视化
 nohup python3 ~/slam_viz.py > /tmp/slam_viz.log 2>&1 &
-echo "✅ Web 可视化: http://192.168.31.220:5800"
+echo "✅ Web 可视化: http://<LAN-IP>:5800"
 
 # 6. rviz2（可选）
 export DISPLAY=:2
@@ -69,7 +69,7 @@ echo "=== 话题检查 ==="
 ros2 topic list | grep -E "/scan|/map|/odom|/tf|/cmd_vel"
 echo ""
 echo "🎉 全部就绪！"
-echo "   Web:  http://192.168.31.220:5800   (先点[启用电机]再驾驶)"
-echo "   VNC:  192.168.31.220:5902"
+echo "   Web:  http://<LAN-IP>:5800   (先点[启用电机]再驾驶)"
+echo "   VNC:  <LAN-IP>:5902"
 echo "   保存: python3 ~/map_saver.py -f ~/my_map"
 echo "   急停: 浏览器 [急停] 按钮, 或 Ctrl-C 本脚本"
