@@ -11,6 +11,6 @@ echo "fire_detect PID=$!"
 
 sleep 1
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-echo "访问   http://${IP:-192.168.31.218}:5812/"
-echo "标注流 http://${IP:-192.168.31.218}:5812/stream.mjpg"
+echo "访问   http://${IP:-<LAN-IP>}:5812/"
+echo "标注流 http://${IP:-<LAN-IP>}:5812/stream.mjpg"
 echo "日志   tail -f /tmp/fire_detect.log"

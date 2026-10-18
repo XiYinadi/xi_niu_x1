@@ -3,9 +3,9 @@
 ## 设备连接
 
 **犀牛派 (AidLux 盒子)**
-- SSH: `ssh aidlux@192.168.31.220` (密码: `aidlux`, 已配密钥免密)
+- SSH: `ssh aidlux@<LAN-IP>` (密码: `<已隐藏>`, 已配密钥免密)
 - 系统: Ubuntu 22.04 / ARM64 / 6核 / 14G RAM
-- VNC: `192.168.31.218:5902` (DISPLAY=:2)
+- VNC: `<LAN-IP>:5902` (DISPLAY=:2)
 
 **RPLidar 激光雷达 A1**
 - USB 芯片: CP210x (`10c4:ea60`)

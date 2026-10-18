@@ -87,7 +87,7 @@ if ! pgrep -f "$PWM_RE" > /dev/null; then
 fi
 
 # ⚠️ 别用 `hostname -I | awk '{print $1}'` 只印第一个地址就当"就是这个"。本机同时有
-#    多个地址(实测 `hostname -I` → "192.168.31.220 192.168.1.1":前者是 wlan0,
+#    多个地址(实测 `hostname -I` → "<LAN-IP> <LAN-IP>":前者是 wlan0,
 #    后者是 AidLux 的 br-lan 网桥),而页面只在其中一个上可达;顺序也不保证。
 #    只印第一个会给出打不开的 URL,且看起来完全正常。所以全列出来。
 IPS=$(hostname -I 2>/dev/null)

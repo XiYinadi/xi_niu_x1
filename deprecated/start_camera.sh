@@ -16,7 +16,7 @@ sleep 4
 
 if grep -q "摄像头已连接" $LOG 2>/dev/null; then
     echo "OK - camera preview running (PID: $PID)"
-    echo "VNC: 192.168.31.218:5902"
+    echo "VNC: <LAN-IP>:5902"
 else
     tail -3 $LOG
 fi

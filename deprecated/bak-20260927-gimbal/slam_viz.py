@@ -15,7 +15,7 @@ slam_viz.py — 犀牛派 SLAM 实时 Web 可视化
   source /opt/ros/humble/setup.bash
   source ~/lidar_ws/install/setup.bash
   python3 slam_viz.py
-  浏览器打开 http://192.168.31.218:5800
+  浏览器打开 http://<LAN-IP>:5800
 """
 
 import base64
@@ -414,7 +414,7 @@ class SlamVizNode(Node):
 # ══════════════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "slam-viz-secret"
+app.config["SECRET_KEY"] = "CHANGE-ME-public"
 socketio = SocketIO(
     app,
     async_mode="threading",
@@ -1081,7 +1081,7 @@ def main():
     threading.Thread(target=log_tail_loop, daemon=True).start()
 
     log.info("Starting Flask-SocketIO on 0.0.0.0:%d", PORT)
-    log.info("Open http://192.168.31.218:%d in your browser", PORT)
+    log.info("Open http://<LAN-IP>:%d in your browser", PORT)
 
     try:
         socketio.run(app, host="0.0.0.0", port=PORT)
