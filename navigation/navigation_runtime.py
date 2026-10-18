@@ -141,27 +141,56 @@ class NavigationRuntime:
 
     def transform_snapshot(self, state):
         from rclpy.time import Time
-        def transform(frame, points):
-            tf = self.tf.lookup_transform('map', frame, Time()).transform
+        def transform(frame, points, stamp=None):
+            query = Time.from_msg(stamp) if stamp is not None else Time()
+            tf = self.tf.lookup_transform('map', frame, query).transform
             angle = yaw(tf.rotation)
-            c, s = math.cos(angle), math.sin(angle)
+            c, sn = math.cos(angle), math.sin(angle)
             out = []
             for x, y in zip(points[::2], points[1::2]):
-                out.extend((c*x-s*y+tf.translation.x, s*x+c*y+tf.translation.y))
-            return out
+                out.extend((c*x-sn*y+tf.translation.x, sn*x+c*y+tf.translation.y))
+            return out, angle
+        # Ordinary mapping also needs map->odom correction, not only Nav2 sessions.
+        if 'pose' in state:
+            try:
+                p = state['pose']
+                xy, angle = transform('odom', [p['x'], p['y']])
+                state['pose'] = dict(x=xy[0], y=xy[1], yaw=math.atan2(
+                    math.sin(p['yaw']+angle), math.cos(p['yaw']+angle)))
+            except Exception:
+                state.pop('pose', None)
         if self.running():
             if self.last_pose is not None:
                 state['pose'] = self.last_pose
             else:
                 state.pop('pose', None)
-            # Historical odom path cannot be mixed with relocalized map coordinates.
             state.pop('trajectory', None)
+        elif 'trajectory' in state:
+            # Reproject all retained odometry history after loop-closure corrections.
+            # One update/second bounds bandwidth; do not mix incremental old transforms.
+            now = time.monotonic()
+            if now-getattr(self, '_trajectory_emit_at', 0) < 1 and not state['trajectory'].get('reset'):
+                state.pop('trajectory', None)
+            else:
+                try:
+                    history = self.node.full_trajectory(map_frame=False)
+                    points, _ = transform('odom', history['points'])
+                    state['trajectory'] = dict(history, points=points, reset=True)
+                    self._trajectory_emit_at = now
+                except Exception:
+                    state.pop('trajectory', None)
         if 'scan' in state:
+            scan = state['scan']
+            stamp = scan.pop('stamp', None)
+            frame = scan.pop('frame', 'laser')
             try:
-                state['scan'] = dict(state['scan'], points=transform('laser', state['scan']['points']))
+                if stamp is None:
+                    raise ValueError('Scan timestamp unavailable')
+                points, _ = transform(frame, scan['points'], stamp)
+                state['scan'] = dict(scan, points=points)
             except Exception:
-                # Untransformed scans would be drawn at the map origin and mislead.
-                state.pop('scan')
+                # Retry the current scan on the next snapshot, never use a newer pose.
+                state.pop('scan', None)
         return state
 
     def localized(self, now):
@@ -410,7 +439,11 @@ class NavigationRuntime:
                 raise ValueError('雷达设备 /dev/ttyUSB0 不存在，请重新插拔雷达 USB')
             if subprocess.run(['pgrep', '-f', '^[^ ]*python3 .*motor_driver[.]py'],
                               stdout=subprocess.DEVNULL).returncode == 0:
-                raise ValueError('旧 motor_driver 正在运行，会与激光里程计争用 TF，请先停掉旧驱动')
+                raise ValueError('旧 motor_driver 正在运行，会与编码器里程计争用 GPIO/TF，请先停掉旧驱动')
+        check = subprocess.run([sys.executable, str(self.root/'slam'/'wheel_odom.py'), '--check'],
+                               capture_output=True, text=True, timeout=10)
+        if check.returncode:
+            raise ValueError(check.stderr.strip() or '编码器里程计标定未通过')
         subprocess.run([sys.executable, str(self.here/'build_nav_params.py')], check=True, timeout=15)
         subprocess.run(['bash', str(self.root/'slam'/'mapping_ctl.sh'), 'stop'], check=True, timeout=15,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)

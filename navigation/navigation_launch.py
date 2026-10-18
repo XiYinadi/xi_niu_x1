@@ -18,8 +18,8 @@ def generate_launch_description():
         IncludeLaunchDescription(PythonLaunchDescriptionSource(
             str(Path(get_package_share_directory('rplidar_ros'))/'launch'/'rplidar_a1_launch.py')),
             launch_arguments={'serial_port': '/dev/ttyUSB0', 'frame_id': 'laser'}.items()),
-        ExecuteProcess(cmd=['python3', str(root/'slam'/'laser_odom.py'),
-                            '--ros-args', '-p', 'base_frame:=base_link'], output='screen'),
+        ExecuteProcess(cmd=['python3', str(root/'slam'/'wheel_odom.py'),
+                            '--params', str(root/'slam'/'wheel_odom.yaml')], output='screen'),
         Node(package='tf2_ros', executable='static_transform_publisher',
              arguments=['0', '0', '0.10', '0', '0', '0', 'base_link', 'laser']),
     ]
