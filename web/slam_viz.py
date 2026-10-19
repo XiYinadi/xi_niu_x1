@@ -242,6 +242,7 @@ class SlamVizNode(Node):
         # 证明不了「现在还在收」。0.0 表示从没收到过(monotonic 单调,不会是 0)。
         self._last_scan_t = 0.0
         self._last_map_t = 0.0
+        self._last_odom_t = 0.0
 
         # QoS: /map needs transient_local to receive last map immediately
         map_qos = QoSProfile(
@@ -333,6 +334,7 @@ class SlamVizNode(Node):
             if len(self._trajectory) > TRAJ_MAX:
                 self._trajectory = self._trajectory[-TRAJ_MAX:]
             self._latest_pose = (x, y, yaw)
+            self._last_odom_t = time.monotonic()
 
     def full_trajectory(self, map_frame=True) -> dict:
         """整条轨迹,只给新连上来的客户端补历史用。
@@ -420,6 +422,7 @@ class SlamVizNode(Node):
             result["feed"] = {
                 "scan_age": (now - self._last_scan_t) if self._last_scan_t else None,
                 "map_age": (now - self._last_map_t) if self._last_map_t else None,
+                "odom_age": (now - self._last_odom_t) if self._last_odom_t else None,
             }
 
         # Encode map PNG outside lock (CPU-heavy, no shared state)
@@ -513,9 +516,11 @@ SCAN_FRESH_S = 2.0    # 雷达 10Hz,2 秒够容忍一次卡顿/丢包
 MAP_FRESH_S = 10.0    # mapping_no_odom.yaml 里 map_update_interval=3.0,给 3 倍余量
 
 
-def mapping_status(scan_age, map_age) -> str:
+def mapping_status(scan_age, map_age, odom_age=None) -> str:
     """age 单位秒;None = 从没收到过。纯函数,可 headless 单测。"""
-    if map_age is not None and map_age < MAP_FRESH_S:
+    if (map_age is not None and 0 <= map_age < MAP_FRESH_S
+            and scan_age is not None and 0 <= scan_age < SCAN_FRESH_S
+            and odom_age is not None and 0 <= odom_age < 1.0):
         return "mapping"
     if scan_age is not None and scan_age < SCAN_FRESH_S:
         return "lidar_only"
@@ -528,17 +533,18 @@ MAPPING_TIMEOUT_S = 45
 _map_lock = threading.Lock()
 _map_busy = False       # 一次只允许一个 start/stop 在路上
 _map_action = None      # 正在进行的是什么,给 UI 显示「启动中…」用
-_map_last = {"scan_age": None, "map_age": None}
+_map_last = {"scan_age": None, "map_age": None, "odom_age": None}
 
 
 def _map_state_payload():
     managed = _navigation is not None and _navigation.running() and getattr(_navigation,'mode',None)=='mapping'
     status = ("localization" if _navigation is not None and _navigation.running() and not managed
-              else mapping_status(_map_last["scan_age"], _map_last["map_age"]))
+              else mapping_status(_map_last["scan_age"], _map_last["map_age"], _map_last["odom_age"]))
     return {
         "status": status,
         "scan_age": _map_last["scan_age"],
         "map_age": _map_last["map_age"],
+        "odom_age": _map_last["odom_age"],
         "busy": _map_busy,
         "action": _map_action,
         "managed": managed,
@@ -629,6 +635,7 @@ def broadcast_loop():
             if feed:
                 _map_last["scan_age"] = feed["scan_age"]
                 _map_last["map_age"] = feed["map_age"]
+                _map_last["odom_age"] = feed["odom_age"]
             p = _map_state_payload()
             key = (p["status"], p["busy"], p["action"],p['managed'])
             if key != last_map_status:
@@ -1007,6 +1014,17 @@ def _on_fire_control(data):
     _fire_publish_state()
 
 
+def drive_packet_fresh(data, now):
+    """Local gamepad timestamps prevent queued commands replaying after a stall."""
+    if 'sent_monotonic' not in data:
+        return True
+    try:
+        age = now - float(data['sent_monotonic'])
+        return math.isfinite(age) and -0.05 <= age <= 0.20
+    except (TypeError, ValueError):
+        return False
+
+
 @socketio.on("motor_control")
 def _on_motor_control(data):
     global _motor_armed, _drive_owner, _drive_owner_note_ts, _gimbal_owner
@@ -1030,6 +1048,13 @@ def _on_motor_control(data):
                 _drive_owner_note_ts = now
                 log.info("Ignoring vel from non-driver/disarmed client %s",
                          request.sid)
+            return
+        if not drive_packet_fresh(data, time.monotonic()):
+            _motor_armed = False
+            _drive_owner = None
+            _send_drive(0.0, 0.0, False)
+            _emit_motor_state()
+            log.warning('Expired gamepad command: motors disarmed')
             return
         # 摇杆/键盘发来已归一化 -1..1 的速度
         lin = float(data.get("linear", 0.0))
