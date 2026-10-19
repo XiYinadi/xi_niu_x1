@@ -39,3 +39,4 @@ web/slam_viz.py.bak-*
 *.bak3-*
 *.bak4-*
 *.before_affinity
+slam/encoder_sampler_poll

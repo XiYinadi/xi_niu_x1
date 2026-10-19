@@ -1,68 +1,201 @@
-/* Input-only simultaneous A/B sampling. Native encoder acquisition; requires independent calibration and health checks.
- * Avoids GPIO edge IRQ delivery to compare raw levels with event-path faults.
- * Sampling can miss transitions: invalid==0 alone does NOT prove no lost counts.
+/*
+ * Event-driven quadrature sampler — replaces the busy-poll GPIOHANDLE loop.
+ *
+ * 2026-10-19: the old version polled GPIOHANDLE_GET_LINE_VALUES in a tight loop
+ * (94% of one core, forever, even when the wheels were still). This one blocks
+ * in poll() on four GPIO_GET_LINEEVENT fds and only wakes on an edge, so idle
+ * CPU is ~0. It is also *more* accurate: every edge is reported, whereas the
+ * polling version could miss a whole transition on fast rotation.
+ *
+ * Contract (unchanged): one JSON line every 20 ms on stdout with
+ *   elapsed, monotonic, counts[2], invalid[2], changes[4], samples,
+ *   max_gap_ms, window_gap_ms, gaps_over_1ms, forward[2], reverse[2], cpu, events
+ *   counts[i] are signed x4 quadrature counts; invalid[i] counts dropped/
+ *   inconsistent transitions (a phase-loss indicator, not proof of none).
+ *
+ * Usage: encoder_sampler_ev <duration_s> [cpu]
+ *   duration 0 = run until SIGINT/SIGTERM.  cpu is an optional affinity mask.
  */
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/gpio.h>
-#include <signal.h>
+#include <poll.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
+
 static volatile sig_atomic_t stopped;
-static void stop(int sig) { (void)sig; stopped=1; }
-static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec/1e9; }
-int main(int argc,char **argv) {
+static void stop(int sig) { (void)sig; stopped = 1; }
+static double now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+/* A(0),B(1) / A(2),B(3) — line order matches the wiring table */
+static const unsigned int OFFS[4] = {0, 12, 5, 1};
+static const int QUAD[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
+
+static int read_level(int fd) {
+    struct gpiohandle_data d;
+    memset(&d, 0, sizeof d);
+    if (ioctl(fd, GPIOHANDLE_GET_LINE_VALUES_IOCTL, &d) < 0)
+        return -1;
+    return d.values[0] ? 1 : 0;
+}
+
+int main(int argc, char **argv) {
     char *end;
-    if(argc<2 || argc>3)return 2;
-    double duration=strtod(argv[1],&end);
-    if(*end || !(duration>=0 && duration<=600))return 2;
-    if(argc==3) {
-        long cpu=strtol(argv[2],&end,10);
-        if(*end || cpu<0 || cpu>=CPU_SETSIZE)return 2;
-        cpu_set_t mask;CPU_ZERO(&mask);CPU_SET(cpu,&mask);
-        if(sched_setaffinity(0,sizeof(mask),&mask)<0){perror("sampler CPU affinity");return 1;}
+    if (argc < 2 || argc > 3)
+        return 2;
+    double duration = strtod(argv[1], &end);
+    if (*end || !(duration >= 0 && duration <= 600))
+        return 2;
+    if (argc == 3) {
+        long cpu = strtol(argv[2], &end, 10);
+        if (*end || cpu < 0 || cpu >= CPU_SETSIZE)
+            return 2;
+        cpu_set_t mask;
+        CPU_ZERO(&mask);
+        CPU_SET(cpu, &mask);
+        if (sched_setaffinity(0, sizeof(mask), &mask) < 0) {
+            perror("sampler CPU affinity");
+            return 1;
+        }
     }
-    int chip=open("/dev/gpiochip0",O_RDONLY|O_CLOEXEC);
-    if(chip<0){perror("chip");return 1;}
-    struct gpiohandle_request req={.lineoffsets={0,12,5,1},.flags=GPIOHANDLE_REQUEST_INPUT|GPIOHANDLE_REQUEST_BIAS_PULL_UP,.lines=4};
-    snprintf(req.consumer_label,sizeof(req.consumer_label),"encoder_sampler");
-    if(ioctl(chip,GPIO_GET_LINEHANDLE_IOCTL,&req)<0){perror("input request");close(chip);return 1;}
-    struct gpiohandle_data levels={0};
-    if(ioctl(req.fd,GPIOHANDLE_GET_LINE_VALUES_IOCTL,&levels)<0){perror("initial read");return 1;}
-    int prev[2]={levels.values[0]*2+levels.values[1],levels.values[2]*2+levels.values[3]};
-    const int quad[16]={0,-1,1,0,1,0,0,-1,-1,0,0,1,0,1,-1,0};
-    long counts[2]={0},invalid[2]={0},changes[4]={0};
-    unsigned char old[4];for(int i=0;i<4;i++)old[i]=levels.values[i];
-    signal(SIGINT,stop);signal(SIGTERM,stop);
-    double start=now(),last=start,printed=start,maxgap=0,windowgap=0;long samples=0,gaps=0;
-    long forward[2]={0},reverse[2]={0};
-    int status=0;
-    while(!stopped && (duration==0 || now()-start<duration)) {
-        if(ioctl(req.fd,GPIOHANDLE_GET_LINE_VALUES_IOCTL,&levels)<0){perror("read");status=1;break;}
-        double t=now(),gap=t-last;last=t;if(gap>maxgap)maxgap=gap;
-        if(gap>windowgap)windowgap=gap;
-        if(gap>.001)gaps++;
+
+    int chip = open("/dev/gpiochip0", O_RDONLY | O_CLOEXEC);
+    if (chip < 0) {
+        perror("chip");
+        return 1;
+    }
+
+    int fds[4];
+    struct pollfd pfd[4];
+    for (int i = 0; i < 4; i++) {
+        struct gpioevent_request req;
+        memset(&req, 0, sizeof req);
+        req.lineoffset = OFFS[i];
+        req.handleflags = GPIOHANDLE_REQUEST_INPUT | GPIOHANDLE_REQUEST_BIAS_PULL_UP;
+        req.eventflags = GPIOEVENT_REQUEST_BOTH_EDGES;
+        snprintf(req.consumer_label, sizeof req.consumer_label, "encoder_sampler_ev");
+        if (ioctl(chip, GPIO_GET_LINEEVENT_IOCTL, &req) < 0) {
+            fprintf(stderr, "lineevent request line %u: %s\n", OFFS[i], strerror(errno));
+            return 1;
+        }
+        fds[i] = req.fd;
+        /* 必须非阻塞:排空事件时最后那次 read() 会一直等下一个边沿,
+         * 加上 signal() 默认 SA_RESTART,SIGTERM 也打断不了 => 进程永不退出
+         * (2026-10-19 实测:duration=3 跑了 3 分钟还不走)。 */
+        int fl = fcntl(fds[i], F_GETFL, 0);
+        if (fl >= 0) fcntl(fds[i], F_SETFL, fl | O_NONBLOCK);
+        pfd[i].fd = req.fd;
+        pfd[i].events = POLLIN;
+    }
+
+    /* 建 fd 时就可能已有排队事件(电平早就稳定了),先排空再读初始电平 ——
+     * 否则第一个事件会被当成「重复边沿」记一次 invalid。 */
+    for (int i = 0; i < 4; i++) {
+        struct gpioevent_data ev;
+        while (read(fds[i], &ev, sizeof ev) == (ssize_t)sizeof ev) { }
+    }
+    int level[4];
+    for (int i = 0; i < 4; i++) {
+        level[i] = read_level(fds[i]);
+        if (level[i] < 0) {
+            perror("initial read");
+            return 1;
+        }
+    }
+    int prev[2] = {level[0] * 2 + level[1], level[2] * 2 + level[3]};
+
+    long counts[2] = {0}, invalid[2] = {0}, changes[4] = {0};
+    long forward[2] = {0}, reverse[2] = {0}, events = 0;
+
+    signal(SIGINT, stop);
+    signal(SIGTERM, stop);
+
+    double start = now(), printed = start, lastwake = start;
+    double maxgap = 0, windowgap = 0;
+    long samples = 0, gaps = 0;
+
+    while (!stopped && (duration == 0 || now() - start < duration)) {
+        int r = poll(pfd, 4, 20);
+        double t = now();
+        double gap = t - lastwake;
+        lastwake = t;
+        if (gap > maxgap) maxgap = gap;
+        if (gap > windowgap) windowgap = gap;
+        if (gap > .001) gaps++;
         samples++;
-        for(int i=0;i<4;i++){changes[i]+=levels.values[i]!=old[i];old[i]=levels.values[i];}
-        for(int i=0;i<2;i++) {
-            int cur=levels.values[i*2]*2+levels.values[i*2+1];
-            invalid[i]+=(cur^prev[i])==3;
-            int delta=quad[prev[i]*4+cur];
-            counts[i]+=delta;forward[i]+=delta>0;reverse[i]+=delta<0;prev[i]=cur;
+
+        if (r > 0) {
+            for (int i = 0; i < 4; i++) {
+                if (!(pfd[i].revents & POLLIN))
+                    continue;
+                struct gpioevent_data ev;
+                while (read(fds[i], &ev, sizeof ev) == (ssize_t)sizeof ev) {
+                    events++;
+                    changes[i]++;
+                    int lvl = (ev.id == GPIOEVENT_EVENT_RISING_EDGE) ? 1 : 0;
+                    int pair = i / 2;
+                    int mask = (i % 2 == 0) ? 2 : 1;   /* first line of pair = A(bit1) */
+                    int st = prev[pair];
+                    int nx = lvl ? (st | mask) : (st & ~mask);
+                    if (nx == st) {
+                        invalid[pair]++;              /* repeated edge: phase lost */
+                        continue;
+                    }
+                    int d = QUAD[(st << 2) | nx];
+                    counts[pair] += d;
+                    forward[pair] += d > 0;
+                    reverse[pair] += d < 0;
+                    prev[pair] = nx;
+                }
+            }
         }
-        if(t-printed>=0.02 || stopped) {
-            printf("{\"elapsed\":%.6f,\"monotonic\":%.9f,\"counts\":[%ld,%ld],\"invalid\":[%ld,%ld],\"changes\":[%ld,%ld,%ld,%ld],\"samples\":%ld,\"max_gap_ms\":%.3f,\"window_gap_ms\":%.3f,\"gaps_over_1ms\":%ld,\"forward\":[%ld,%ld],\"reverse\":[%ld,%ld],\"cpu\":%d}\n",t-start,t,counts[0],counts[1],invalid[0],invalid[1],changes[0],changes[1],changes[2],changes[3],samples,maxgap*1000,windowgap*1000,gaps,forward[0],forward[1],reverse[0],reverse[1],sched_getcpu());
-            fflush(stdout);printed=t;windowgap=0;
+
+        /* Every report tick, re-read the real levels. Any disagreement means we
+         * lost events (queue overflow) — count it, resync, never fabricate. */
+        if (t - printed >= 0.02 || stopped) {
+            for (int i = 0; i < 4; i++) {
+                int lv = read_level(fds[i]);
+                if (lv < 0) continue;
+                level[i] = lv;
+            }
+            for (int p = 0; p < 2; p++) {
+                int real = level[p * 2] * 2 + level[p * 2 + 1];
+                if (real != prev[p]) {
+                    invalid[p]++;
+                    int d = QUAD[(prev[p] << 2) | real];
+                    counts[p] += d;
+                    prev[p] = real;
+                }
+            }
+            printf("{\"elapsed\":%.6f,\"monotonic\":%.9f,\"counts\":[%ld,%ld],"
+                   "\"invalid\":[%ld,%ld],\"changes\":[%ld,%ld,%ld,%ld],"
+                   "\"samples\":%ld,\"max_gap_ms\":%.3f,\"window_gap_ms\":%.3f,"
+                   "\"gaps_over_1ms\":%ld,\"forward\":[%ld,%ld],\"reverse\":[%ld,%ld],"
+                   "\"cpu\":%d,\"events\":%ld}\n",
+                   t - start, t, counts[0], counts[1], invalid[0], invalid[1],
+                   changes[0], changes[1], changes[2], changes[3], samples,
+                   maxgap * 1000, windowgap * 1000, gaps, forward[0], forward[1],
+                   reverse[0], reverse[1], sched_getcpu(), events);
+            fflush(stdout);
+            printed = t;
+            windowgap = 0;
         }
-        /* Optional fast mode is a bounded diagnostic on one CPU core. */
-        /* Full-rate native sampling: one core, no Python GIL or edge IRQ queue. */
     }
-    close(req.fd);close(chip);return status;
+
+    for (int i = 0; i < 4; i++) close(fds[i]);
+    close(chip);
+    return 0;
 }
