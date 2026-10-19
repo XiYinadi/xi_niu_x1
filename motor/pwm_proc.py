@@ -62,7 +62,15 @@ import json
 import os
 import signal
 import socket
+import subprocess
 import sys
+import threading
+
+# 2026-10-19: 本进程里两个线程都要做 µs 级时序(电机 1kHz / 舵机 50Hz),
+# 而 CPython 默认每 5ms 才强制切换一次 GIL —— 舵机线程 sleep 醒来后最长要等
+# 5ms 才能跑,脉宽被拖到 3.4ms(p95)/16ms(max),现场表现就是「按住转向时抖」。
+# 压到 0.2ms:切换开销可忽略,而两个线程的等待上限都降了一个数量级。
+sys.setswitchinterval(0.0002)
 import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -99,6 +107,99 @@ def load_params(path):
         return doc['motor_driver']['ros__parameters']
     except (TypeError, KeyError):
         sys.exit('%s 里没有 motor_driver.ros__parameters 段' % path)
+
+
+class ServoLink:
+    """舵机 PWM 的**代理**:真正的脉冲由独立进程 servo_proc.py 生成。
+
+    2026-10-19: 原来舵机 PWM 在本进程里跑线程,和 1kHz 电机 PWM 线程抢 GIL,
+    实测脉宽 p50=1756µs 但 p95=3.4ms / max=16ms(指令 1.75ms)⇒ 按住转向时抖。
+    本类只负责:起停子进程 + 把归一化指令发过去。
+    接口与 SoftServoPwm 对齐(park/set_command/parked/pulse_us/stats),所以
+    PwmProc 里的门控(stale/armed/idle_park)一个字都不用改。
+    ⚠️ 子进程 300ms 收不到消息会自己 park —— 本进程崩了舵机也不会一直咬转角。
+    """
+
+    def __init__(self, chip_name, line, freq=50.0, center_us=1500.0,
+                 range_us=500.0, min_us=500.0, max_us=2500.0,
+                 invert=False, deadband=0.0, hysteresis_us=0.0, logger=None):
+        self._center = float(center_us)
+        self._range = float(range_us)
+        self._lo = float(min_us)
+        self._hi = float(max_us)
+        self._invert = bool(invert)
+        self._deadband = abs(float(deadband))
+        self._hyst = abs(float(hysteresis_us))
+        self._pulse = None
+        self._lock = threading.Lock()
+        self._port = 5816
+        self._addr = ('127.0.0.1', self._port)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        script = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'servo_proc.py')
+        logf = open('/tmp/servo_proc.log', 'ab', buffering=0)
+        self._proc = subprocess.Popen(
+            [sys.executable, script,
+             '--chip', str(chip_name), '--line', str(line),
+             '--freq', str(freq), '--center', str(center_us),
+             '--range', str(range_us), '--min', str(min_us),
+             '--max', str(max_us), '--port', str(self._port)],
+            stdout=logf, stderr=subprocess.STDOUT)
+        time.sleep(0.2)
+        if self._proc.poll() is not None:
+            raise RuntimeError('servo_proc 启动即退出(见 /tmp/servo_proc.log)')
+
+    def _send(self, text):
+        try:
+            self._sock.sendto(text.encode('ascii'), self._addr)
+        except OSError:
+            pass
+
+    def set_command(self, x):
+        x = max(-1.0, min(1.0, float(x)))
+        if self._deadband > 0.0 and abs(x) < self._deadband:
+            x = 0.0
+        if self._invert:
+            x = -x
+        us = min(self._hi, max(self._lo, self._center + x * self._range))
+        with self._lock:
+            cur = self._pulse
+            if cur is not None and self._hyst > 0.0 and abs(us - cur) < self._hyst:
+                us = cur            # 滞回:微小抖动不逐帧追
+            self._pulse = us
+        self._send('%.1f' % us)
+
+    def park(self):
+        with self._lock:
+            self._pulse = None
+        self._send('park')
+
+    @property
+    def parked(self):
+        return self._pulse is None
+
+    @property
+    def pulse_us(self):
+        return self._pulse
+
+    def stats(self):
+        return None                 # 实测脉宽在 /tmp/servo_proc.log 里
+
+    def start(self):
+        pass
+
+    def stop(self):
+        with self._lock:
+            self._pulse = None
+        self._send('park')
+        try:
+            self._proc.terminate()
+            self._proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
 
 
 class PwmProc:
@@ -168,7 +269,7 @@ class PwmProc:
         # 在跑,不会留下一个半启动的进程。
         if self._servo_enable:
             try:
-                self.servo = SoftServoPwm(
+                self.servo = ServoLink(
                     chip_name=p['gpiochip'],
                     line=self._servo_line,
                     freq=float(p.get('servo_freq', 50.0)),
@@ -178,6 +279,7 @@ class PwmProc:
                     max_us=float(p.get('servo_max_us', 2500.0)),
                     invert=bool(p.get('servo_invert', False)),
                     deadband=self._servo_deadband,
+                    hysteresis_us=float(p.get('servo_hysteresis_us', 0.0)),
                 )
             except Exception as e:
                 # 文案必须点名是**舵机 line**。否则照抄上面那段「先停 motor_driver」
@@ -378,6 +480,10 @@ class PwmProc:
             sv = 'PARK(idle)' if (driven and self._idle_park.idle) else 'PARK'
         else:
             sv = '%.0fus' % (self.servo.pulse_us or 0.0)
+            _st = self.servo.stats()
+            if _st:
+                sv += '(实测 p50=%.0f p95=%.0f max=%.0f n=%d)' % (
+                    _st['p50'], _st['p95'], _st['max'], _st['n'])
         # steer= 必须打出来:steer_mode=servo 时 a 只走舵机,**a 变化而 duty 不变
         # 是正常现象**。没有这一列的话,「打方向轮子不动」看起来和故障一模一样
         # —— 而这正是刚刚特意改成的行为。

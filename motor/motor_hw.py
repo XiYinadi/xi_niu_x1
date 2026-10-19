@@ -203,7 +203,7 @@ class SoftServoPwm:
 
     def __init__(self, chip_name, line, freq=50.0, center_us=1500.0,
                  range_us=500.0, min_us=500.0, max_us=2500.0,
-                 invert=False, deadband=0.0, logger=None):
+                 invert=False, deadband=0.0, hysteresis_us=0.0, logger=None):
         if not _GPIO_AVAILABLE:
             raise RuntimeError(
                 'gpiod (libgpiod v1.x python bindings) not importable. '
@@ -216,6 +216,15 @@ class SoftServoPwm:
         self._hi = float(max_us)
         self._invert = bool(invert)
         self._deadband = abs(float(deadband))
+        # 脉宽域滞回(2026-10-19,「按住转向时抖」):输入 a 的微小抖动会让舵机每帧
+        # 都重新纠偏。_hyst 之内的变化直接不更新 —— 这是**指令量化**,不是斜率
+        # 限幅:正常打方向每步远超它(不增加跟随延迟),park→驱动时
+        # (_pulse is None)无条件接受第一帧。
+        self._hyst = abs(float(hysteresis_us))
+        self._stat_lock = threading.Lock()
+        self._widths = []          # 最近若干帧**实测**高电平时长(秒)
+        self._cmds = []            # 对应指令脉宽(µs)
+        self._stat_max = 250       # ≈5 秒(50Hz)
 
         # 脉冲必须短于帧周期。把 servo_freq 往上调错会让 _busy_until 立即返回、
         # 循环空转成远短于 20ms 的高电平 —— 舵机收到的就不是脉冲串而是**持续高
@@ -275,8 +284,14 @@ class SoftServoPwm:
 
     def set_pulse_us(self, us):
         """直接给脉宽(µs),仍然过电气硬限位。"""
+        us = min(self._hi, max(self._lo, float(us)))
         with self._lock:
-            self._pulse = min(self._hi, max(self._lo, float(us)))
+            cur = self._pulse
+            # cur is None = park:必须**无条件**接受,否则恢复驱动时的第一帧会被
+            # 滞回吞掉(舵机晚 20ms 才动)。
+            if cur is not None and self._hyst > 0.0 and abs(us - cur) < self._hyst:
+                return
+            self._pulse = us
 
     def park(self):
         """不发任何脉冲 → 舵机松掉、几乎不吃电。"""
@@ -290,6 +305,32 @@ class SoftServoPwm:
     @property
     def pulse_us(self):
         return self._pulse
+
+    def _record(self, t_rise, t_fall, us):
+        w = t_fall - t_rise
+        with self._stat_lock:
+            self._widths.append(w)
+            self._cmds.append(us)
+            if len(self._widths) > self._stat_max:
+                del self._widths[0]
+                del self._cmds[0]
+
+    def stats(self):
+        """最近约 5 秒的**实测**高电平时长(µs)。只给状态行看,不参与控制。"""
+        with self._stat_lock:
+            if not self._widths:
+                return None
+            w = sorted(x * 1e6 for x in self._widths)
+            n = len(w)
+            return {
+                'n': n,
+                'cmd': self._cmds[-1],
+                'min': w[0],
+                'p50': w[n // 2],
+                'p95': w[min(n - 1, int(n * 0.95))],
+                'max': w[-1],
+                'mean': sum(w) / n,
+            }
 
     # ---------------------------------------------------------------- loop
     def _loop(self):
@@ -305,8 +346,24 @@ class SoftServoPwm:
                 continue
             t0 = time.monotonic()
             self._line.set_value(1)
-            DualSoftPwm._busy_until(t0 + us / 1e6)
+            # 2026-10-19: 脉宽起点必须取**实际拉高之后**的时刻。原实现取在
+            # set_value(1) 之前,而这个 syscall 会被电机 PWM 线程的 GIL 自旋
+            # 推迟(最多 ~300µs)⇒ 每帧高电平比指令短 0~300µs,舵机「按住转向」
+            # 时会来回找角度。这是抖动的来源之一。
+            t_rise = time.monotonic()
+            # 高电平只有 1~2.5ms,整段自旋(不 sleep):_busy_until 的 sleep 分支
+            # 一旦过冲就是几十~上千 µs,而这段时间线还拉着高 —— 舵机看到的就是
+            # 一个明显偏长的脉冲。自旋的代价是这段时间占着 GIL,所以上面把
+            # sys.setswitchinterval 调到了 0.2ms,让它能按时让出。
+            _t_end = t_rise + us / 1e6
+            while time.monotonic() < _t_end:
+                pass
+            # 时间戳取在拉低**之前**:拉低之后再取,一旦线程在两次调用之间被
+            # 抢占,记录到的是「调度延迟」而不是高电平时长 —— 会把 1.7ms 的脉冲
+            # 记成 15ms,看起来像舵机自己在发疯(2026-10-19 第一次测量就撞上)。
+            t_fall = time.monotonic()
             self._line.set_value(0)
+            self._record(t_rise, t_fall, us)
             # 帧尾这段要等 ~18.5ms,远大于 COARSE_SLEEP,所以几乎全在 sleep、只有
             # 最后 300µs 自旋。用 _busy_until 而不是裸 sleep 是为了和 DualSoftPwm
             # 共用同一套时序写法;代价是那 300µs 的 GIL,而换来的帧对齐精度远超舵机
