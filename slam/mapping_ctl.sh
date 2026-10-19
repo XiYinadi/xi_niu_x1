@@ -39,7 +39,7 @@ SLAM_LOG=/tmp/slam.log
 
 # 这 4 个文件必须和 slam_viz.py 的 LOG_FILES 一致 —— 网页日志窗口 tail 的就是它们,
 # 换名字不会报错,只会让日志窗口安静下来。
-PROCS=(rplidar_node wheel_odom static_transform_publisher async_slam_toolbox_node)
+PROCS=(rplidar_node 'wheel_odom[.]py' static_transform_publisher async_slam_toolbox_node)
 
 usage() {
     echo "用法: bash $0 start|stop|status" >&2
@@ -47,11 +47,20 @@ usage() {
 }
 
 # 有没有在跑(供预检用)。用 pgrep 而不是 pgrep -f 全量匹配,避免匹配到自己的参数。
-running() { pgrep -f "$1" >/dev/null 2>&1; }
+process_pattern() {
+    case "$1" in
+        *odom*py*|*motor_driver*) printf '^[^ ]*python3 [^ ]*/%s([ ]|$)' "$1" ;;
+        rplidar_node|static_transform_publisher|async_slam_toolbox_node)
+            printf '^[^ ]*/%s([ ]|$)' "$1" ;;
+        *) printf '^[^ ]*/%s' "$1" ;;
+    esac
+}
+running() { pgrep -f "$(process_pattern "$1")" >/dev/null 2>&1; }
 
 # 杀干净:先 SIGTERM,复核,残余再 SIGKILL。返回剩余数量。
 kill_wait() {
-    local pat="$1" n
+    local pat n
+    pat=$(process_pattern "$1")
     pkill -f "$pat" 2>/dev/null
     for _ in 1 2 3 4 5; do
         sleep 0.2
@@ -74,11 +83,11 @@ do_stop() {
         fi
     done
     # ros2 launch 的父进程(它自己会在子节点死后退出,但可能赖着)
-    pkill -f 'rplidar_a1_launch' 2>/dev/null
+    pkill -f '^[^ ]*python3 [^ ]*/ros2 launch rplidar_ros rplidar_a1_launch[.]py' 2>/dev/null
 
     if [ "$leftover" -gt 0 ]; then
         echo "⚠️ 停止不干净:有进程 SIGKILL 后仍在"
-        for pat in "${PROCS[@]}"; do pgrep -af "$pat" 2>/dev/null; done
+        for pat in "${PROCS[@]}"; do pgrep -af "$(process_pattern "$pat")" 2>/dev/null; done
         return 1
     fi
     echo "已停止"
@@ -87,7 +96,7 @@ do_stop() {
 
 do_start() {
     # Localization owns the same scanner/TF chain. Refuse a second publisher.
-    if running 'ros2 launch .*/robot/navigation/navigation_launch[.]py'; then
+    if pgrep -f '^[^ ]*python3 [^ ]*/ros2 launch .*/robot/navigation/navigation_launch[.]py' >/dev/null; then
         echo "请先在网页停止定位，再启动建图"
         return 6
     fi
@@ -173,9 +182,7 @@ do_start() {
         sleep 0.5
     done
     echo "已拉起 $alive/4 个进程(是否真的在建图,看地图窗口有没有在画)"
-    # 只有**一个都没起来**才算脚本失败。差一个不当失败:上面的过滤按进程名匹配,
-    # 而真正的判据是 /scan 与 /map 的数据流(可能少一个照样在出图,也可能四个
-    # 全在却因为雷达没插而不出图)。
+    # 缺任意节点都清理本次启动；四个进程齐全仍不等于数据流健康。
     if [ "$alive" -lt 4 ]; then
         tail -n 8 "$ODOM_LOG"
         do_stop
@@ -188,7 +195,7 @@ do_status() {
     local found=0
     for pat in "${PROCS[@]}"; do
         local out
-        out=$(pgrep -af "$pat" 2>/dev/null)
+        out=$(pgrep -af "$(process_pattern "$pat")" 2>/dev/null)
         if [ -n "$out" ]; then
             found=1
             echo "$out"

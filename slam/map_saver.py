@@ -67,7 +67,6 @@ class MapSaver(Node):
         write_yaml(msg, pgm_path.name, yaml_path)
 
         self.get_logger().info(f"Map saved: {pgm_path} + {yaml_path}")
-        rclpy.shutdown()
 
 
 def main():
@@ -79,7 +78,17 @@ def main():
     args = parser.parse_args()
 
     rclpy.init(args=sys.argv[1:])
-    rclpy.spin(MapSaver(args.file))
+    node = MapSaver(args.file)
+    # 2026-10-19: 不能在回调里 rclpy.shutdown() —— spin() 还在跑,进程会挂在 DDS
+    # 等待里出不来,连 `timeout` 的 SIGTERM 都进不了主线程(实测挂 5 分钟)。
+    # 改成自己转循环,拿到一张图就收工。
+    while rclpy.ok() and not node.received:
+        rclpy.spin_once(node, timeout_sec=0.5)
+    node.destroy_node()
+    try:
+        rclpy.shutdown()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

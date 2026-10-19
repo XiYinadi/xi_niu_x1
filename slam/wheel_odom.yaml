@@ -9,5 +9,12 @@ counts_per_meter_left: 260005.309185
 counts_per_meter_right: 251283.618304
 sign_left: 1
 sign_right: -1
+# User confirmed the encoders were previously tested. Retain the independent
+# one-revolution scales above, NOT the inconsistent ground-trial ratio.
+# This enables provisional wheel mapping, not a claim of verified map accuracy.
 calibrated: true
+calibration_basis: manual_one_revolution
+ground_validation_passed: false
+# Explicit affinity only for the input-only native child, never for ROS/PWM.
+sampler_cpu: 1
 max_wheel_speed_mps: 0.5
