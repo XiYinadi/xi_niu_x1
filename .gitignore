@@ -32,3 +32,10 @@ data/autonomy/
 slam/encoder_sampler
 web/slam_viz.py.bak-*
 *.tmp-patch
+
+# 2026-10-19: 现场改动留下的备份/临时文件（不进库）
+*.bak-*
+*.bak2-*
+*.bak3-*
+*.bak4-*
+*.before_affinity
