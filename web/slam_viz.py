@@ -2091,7 +2091,7 @@ button:focus-visible,summary:focus-visible,a:focus-visible { outline:2px solid v
 <section class="mission-only mission-card" id="mission-route"><span class="mission-step">02 / 预览</span><h2 id="mission-route-title">查看任务目标</h2><div id="mission-route-controls"></div><p id="mission-preview-note">配置和预览不会启用电机。</p></section>
 <section class="mission-only mission-card" id="mission-run"><span class="mission-step">03 / 执行</span><h2>现场监督执行</h2><p id="mission-run-note">标定和定位就绪后，由当前页面启用电机，再明确启动任务。</p><div id="mission-run-controls"></div><div class="mission-progress"><span id="mission-stage">等待任务</span><strong id="mission-progress">0</strong><small>已完成目标 / 点位</small></div><div id="mission-runtime"></div><div id="mission-runtime-controls"></div></section>
 <section class="mapping-only mapping-odometry" aria-label="实时里程计">
-<div class="card-heading"><h2>实时里程计</h2><span id="mp-odometry-state" class="status-pill">等待数据</span></div>
+<div class="card-heading"><h2>实时里程计</h2><span id="mp-odometry-state" class="status-pill">等待数据</span><button type="button" class="odometry-collapse" id="btn-odometry-collapse" aria-expanded="true" title="折叠/展开实时里程计">收起</button></div>
 <p class="odometry-source">雷达 + GY-521 · /odom</p>
 <div class="odometry-toolbar"><span>相对测量起点</span><button type="button" id="mp-odometry-zero" disabled>设为测量起点</button></div>
 <div class="odometry-grid">
@@ -2164,7 +2164,7 @@ button:focus-visible,summary:focus-visible,a:focus-visible { outline:2px solid v
             <div class="joy-lab">↑上 ↓下　←左 →右</div>
           </div>
           <div id="gimbal-val">dx +0　dy +0</div>
-          <div id="gimbal-hint">云台:不必「启用电机」</div>
+<div id="gimbal-hint">云台：Shift+WASD 或拖盘（不必「启用电机」）</div>
         </div>
       </div><div id="navigation-panel">
 <details class="task-group" id="mapping-actions"><summary><span class="step">01</span> 建立地图</summary><h2 class="mapping-only">建图操作</h2>
@@ -2208,6 +2208,7 @@ button:focus-visible,summary:focus-visible,a:focus-visible { outline:2px solid v
         <button class="btn" id="btn-zoomin" title="放大">+</button>
         <button class="btn" id="btn-reset" title="复位视图">⌂</button>
         <button class="btn" id="btn-full" title="最大化/还原地图">⛶</button>
+        <button class="btn mapping-only" id="btn-map-collapse" aria-expanded="true" title="折叠/展开实时建图">收起</button>
       </span>
     </header>
     <div class="win-body" id="map-body">
@@ -2763,7 +2764,12 @@ document.addEventListener('keydown', e => {
   if (e.repeat) return;
   keys[e.key] = true;
 });
-document.addEventListener('keyup', e => { keys[e.key] = false; });
+document.addEventListener('keyup', e => {
+  keys[e.key] = false;
+  // 2026-10-25: Shift 按住时 e.key 是大写，先松 Shift 再松 W 会留下 keys['W']=true
+  // 卡在云台上；两个都清。
+  if (e.key.length === 1) { keys[e.key.toLowerCase()] = false; keys[e.key.toUpperCase()] = false; }
+});
 
 // 虚拟摇杆: 上=前进 下=后退,左=左转 右=右转。
 // 松手回中(弹簧回中),与真车遥控器一致 —— 也是「死人手柄」在触屏上的自然形态。
@@ -2964,10 +2970,14 @@ function driveTarget() {
     l -= p.vy;
     a -= p.vx;
   }
-  if (keys['w'] || keys['ArrowUp']) l += 1;
-  if (keys['s'] || keys['ArrowDown']) l -= 1;
-  if (keys['a'] || keys['ArrowLeft']) a += 1;
-  if (keys['d'] || keys['ArrowRight']) a -= 1;
+  // 2026-10-25: Shift 按住时键盘让给云台（Shift+WASD），驾驶只认摇杆/方向键；
+  // 否则两套指令同时生效，调相机会把车也带着走。
+  if (!keys['Shift']) {
+    if (keys['w'] || keys['W'] || keys['ArrowUp']) l += 1;
+    if (keys['s'] || keys['S'] || keys['ArrowDown']) l -= 1;
+    if (keys['a'] || keys['A'] || keys['ArrowLeft']) a += 1;
+    if (keys['d'] || keys['D'] || keys['ArrowRight']) a -= 1;
+  }
   return {
     l: Math.max(-1, Math.min(1, l)) * (speedGear === 'low' ? LOW_GEAR_MAX : 1),
     a: Math.max(-1, Math.min(1, a)),
@@ -3036,6 +3046,16 @@ function gimbalTick() {
     dx += Math.round(p.vx * GIMBAL_SCALE);
     dy += Math.round(-p.vy * GIMBAL_SCALE);
   }
+  // 2026-10-25: Shift+WASD 叠加到云台（W 上 / S 下 / A 左 / D 右）。
+  // 大写字母是 Shift 按住时 e.key 的真实值；CapsLock 的 'W' 没有 Shift，不触发。
+  if (keys['Shift']) {
+    if (keys['w'] || keys['W']) dy += GIMBAL_SCALE;
+    if (keys['s'] || keys['S']) dy -= GIMBAL_SCALE;
+    if (keys['a'] || keys['A']) dx -= GIMBAL_SCALE;
+    if (keys['d'] || keys['D']) dx += GIMBAL_SCALE;
+  }
+  dx = Math.max(-GIMBAL_SCALE, Math.min(GIMBAL_SCALE, dx));
+  dy = Math.max(-GIMBAL_SCALE, Math.min(GIMBAL_SCALE, dy));
   gimbalValEl.textContent = 'dx ' + fmtSignedInt(dx) + '　dy ' + fmtSignedInt(dy);
   // 非驾驶者的读数照常刷新(方便先看清数值再动),但没连接就别发 —— 发了也没人收,
   // 只会让 read() 之类的计数出现幻影包。
@@ -3257,6 +3277,26 @@ document.getElementById('btn-reset').addEventListener('click', () => { fitView()
 document.getElementById('btn-full').addEventListener('click', () => {
   const full = document.getElementById('win-map').classList.toggle('full');
   document.getElementById('btn-full').classList.toggle('active', full);
+});
+
+// 2026-10-25: 实时建图窗口折叠（只改 mapping 页的网格行高，别影响控制台布局）
+// 2026-10-25: 实时里程计卡片折叠（只藏内容，标题保留）
+document.getElementById('btn-odometry-collapse').addEventListener('click', () => {
+  const card = document.querySelector('.mapping-odometry');
+  const collapsed = card.classList.toggle('collapsed');
+  const button = document.getElementById('btn-odometry-collapse');
+  button.textContent = collapsed ? '展开' : '收起';
+  button.setAttribute('aria-expanded', String(!collapsed));
+});
+
+document.getElementById('btn-map-collapse').addEventListener('click', () => {
+  const win = document.getElementById('win-map');
+  const collapsed = win.classList.toggle('collapsed');
+  document.body.classList.toggle('map-collapsed', collapsed);
+  const button = document.getElementById('btn-map-collapse');
+  button.textContent = collapsed ? '展开' : '收起';
+  button.setAttribute('aria-expanded', String(!collapsed));
+  requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
 });
 
 // ── 交互:平移 / 缩放 / 复位 ─────────────────────────────────────

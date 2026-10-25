@@ -254,3 +254,13 @@
 @media (prefers-reduced-motion:reduce) {
   .mapping-page *, .mapping-page *::before, .mapping-page *::after { animation:none!important; transition:none!important; }
 }
+
+/* 2026-10-25: 实时建图窗口可折叠 */
+.mapping-page #win-map #btn-map-collapse { width:auto; padding:0 9px; font-size:11px; }
+.mapping-page #win-map.collapsed { min-height:49px; align-self:start; }
+.mapping-page.map-collapsed #workspace { grid-template-rows:auto auto auto auto; }
+
+/* 2026-10-25: 实时里程计折叠 */
+.mapping-page .mapping-odometry .odometry-collapse { margin-left:auto; padding:5px 10px; font:inherit; font-size:11px; border-radius:6px; background:#263b44; color:#e0eeeb; border:1px solid #3a545c; cursor:pointer; }
+.mapping-page .mapping-odometry .odometry-collapse:hover { background:#314a54; }
+.mapping-page .mapping-odometry.collapsed > :not(.card-heading) { display:none; }

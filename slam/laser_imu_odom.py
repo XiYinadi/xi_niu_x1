@@ -17,7 +17,8 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import TransformStamped
 from tf2_ros import TransformBroadcaster
 from laser_odom_core import scan_to_points_normals, compose_pose
-from gyro_core import GyroHistory, KeyframeMotion, MotionDiscontinuity, MotionRejected, align
+from gyro_core import (GyroHistory, KeyframeMotion, MotionDiscontinuity, MotionReanchor,
+                       MotionRejected, align)
 from laser_mount import load_mount
 
 
@@ -111,6 +112,13 @@ class LaserImuOdom(Node):
         except MotionRejected as error:
             self.failed += 1
             self.get_logger().warning(str(error))
+            return
+        except MotionReanchor:
+            # 2026-10-25: 拒帧超时不再永久挂起；把当前扫描当新参考，继续出里程计。
+            self.reference = (points, normals, stamp)
+            self.motion = KeyframeMotion(stamp, self.pose)
+            self.failed += 1
+            self.get_logger().warning('里程计参考已重新锚定（拒帧超时）：接管一次位姿跳变，继续输出')
             return
         except MotionDiscontinuity as error:
             self.failed += 1

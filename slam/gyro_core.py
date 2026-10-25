@@ -59,6 +59,10 @@ class MotionRejected(ValueError):
     """No output for this scan; recheck against the unchanged trusted reference."""
 
 
+class MotionReanchor(ValueError):
+    """Recheck expired; re-anchor to the current scan and keep publishing."""
+
+
 class KeyframeMotion:
     """Pose relative to a retained scan, not a sum of every noisy scan pair.
 
@@ -66,7 +70,7 @@ class KeyframeMotion:
     produces its measured pose, including small motion; no zero-motion deadband.
     Velocity uses the previous publication interval, not the keyframe interval.
     """
-    def __init__(self, stamp, pose=(0.,0.,0.), max_speed_mps=.5, noise_allowance_m=.01):
+    def __init__(self, stamp, pose=(0.,0.,0.), max_speed_mps=1.5, noise_allowance_m=.01):
         # This is a supported estimation envelope, not a measured motor speed.
         # It exceeds the supervised 0.08m/s trials and the 0.10m/s Nav2 cap.
         if any(isinstance(v,bool) or not math.isfinite(v) or v<=0 for v in (max_speed_mps,noise_allowance_m)):
@@ -100,8 +104,10 @@ class KeyframeMotion:
                 raise ValueError('Non-increasing recheck stamp')
             self.recheck['stamp']=stamp
             if dt>.4:
-                self.fault='Laser recheck expired; odom suspended, stop and restart localization at rest'
-                raise MotionDiscontinuity(self.fault)
+                # 2026-10-25: 原来设 fault 永久挂起，手动建图开一会儿就再也回不来。
+                # 改成让调用方把当前扫描重新锚定，继续出里程计（接受一次跳变）。
+                self.recheck=None
+                raise MotionReanchor('Laser recheck expired; re-anchoring to the current scan')
             limit=self.recheck['limit']
         if distance>limit:
             self.recheck=dict(limit=limit,stamp=stamp,candidate=None)

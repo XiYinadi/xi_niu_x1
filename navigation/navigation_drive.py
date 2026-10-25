@@ -12,9 +12,11 @@ def validate_navigation(config):
         return validate_calibration(config)
     # 2026-10-24: 上限从已验证包络(0.05/10%/15°/0.5)抬到实验包络
     # (0.12/20%/20°/0.7)。calibrated 仍为 false，这组数没有实车标定背书。
-    limits={'max_speed_mps':.12,'trial_pwm_cap':.20,'trial_max_steering_rad':math.radians(20),
-        'trial_max_joystick':.7,'trial_max_duration_s':45.,'trial_max_goal_m':1.,
-        'trial_max_travel_m':1.15,'trial_max_path_m':1.2}
+    # 2026-10-25: 标定前临时解除距离/角度限制（1m/1.2m/45s/20° -> 5m/6m/180s/25°）。
+    # 传感器 0.4s 上限、净空 0.2m、速度 0.12m/s、PWM 20% 仍然生效。
+    limits={'max_speed_mps':.20,'trial_pwm_cap':.35,'trial_max_steering_rad':math.radians(25),
+        'trial_max_joystick':.85,'trial_max_duration_s':180.,'trial_max_goal_m':5.,
+        'trial_max_travel_m':6.,'trial_max_path_m':6.}
     for key,maximum in limits.items():
         value=config.get(key)
         if type(value) not in (float,int) or not math.isfinite(value) or not 0<value<=maximum+1e-9:
@@ -40,7 +42,7 @@ class TrialDrive:
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
         self.feedback=module.Feedback(1/3,duty_cap=config['trial_pwm_cap'])
         self.config=config
-    def reset(self):self.feedback.reset()
+    def reset(self):self.feedback.reset();self.over=0
     def step(self,v,w,measured_v,dt):
         # 0.15s 是「20Hz 控制节拍」的假设，但控制循环跑在网页广播循环里，
         # load 高时一次 emit 就能超过它。Feedback 内部本来就把 dt 钳到 0.04，
@@ -48,7 +50,14 @@ class TrialDrive:
         if not all(math.isfinite(x) for x in (v,w,measured_v,dt)) or not 0<dt<=.5:
             raise ValueError('速度反馈或控制节拍异常')
         if v<0 or v>self.config['max_speed_mps']+.001:raise ValueError('试航仅允许0至%.2f m/s前进'%self.config['max_speed_mps'])
-        if measured_v<-.03 or measured_v>.25:raise ValueError('实测速度异常，已停止试航')
+        # 2026-10-25: 单帧尖峰不中止；连续 3 帧超 0.60 m/s 才判异常。
+        # 控制用的速度钳到 ±0.5，尖峰不直接进反馈环。
+        if measured_v<-.03 or measured_v>.60:
+            self.over=getattr(self,'over',0)+1
+            if self.over>=3:raise ValueError('实测速度异常，已停止试航')
+        else:
+            self.over=0
+        measured_v=max(-.5,min(.5,measured_v))
         if v<.005:
             # 舵机底盘不能原地转；终点前控制器偶尔会这么请求。宁可**停住**
             # 交给目标检查器判定，也不要因为一句限制把已经走完的试航判死。

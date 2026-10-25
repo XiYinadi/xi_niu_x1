@@ -20,7 +20,7 @@ class Feedback:
     A zero target bypasses PI immediately. Missing feedback is handled by bridge.
     """
     def __init__(self, k, duty_cap=.10):
-        if not math.isfinite(k) or k<=0 or not 0<duty_cap<=.25:
+        if not math.isfinite(k) or k<=0 or not 0<duty_cap<=.40:
             raise ValueError('invalid conversion or diagnostic duty cap')
         self.k, self.cap = k, duty_cap
         self.reset()
@@ -31,7 +31,7 @@ class Feedback:
     def step(self, v, w, measured_v, measured_w, dt, diff=False):
         if not all(math.isfinite(x) for x in (v,w,measured_v,measured_w,dt)):
             raise ValueError('non-finite command/feedback')
-        if not 0<=v<=.15 or abs(w)>.30:
+        if not 0<=v<=.25 or abs(w)>.40:
             raise ValueError('diagnostic speed limits: 0..0.08m/s, +/-0.20rad/s')
         if not diff and abs(w)>1e-6:
             raise ValueError('angular test requires explicit temporary differential mode')
