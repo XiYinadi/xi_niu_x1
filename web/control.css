@@ -1,0 +1,109 @@
+/* Camera-first remote control, scoped so mapping and the console keep their layout. */
+.control-page { --bg:#10191e; --accent:#8ae3c5; --dim:#94a9b0; --line:#2b3b42; background:var(--bg); }
+.control-page .control-only { display:block; }
+.control-page .console-only,.control-page .control-intro,.control-page #navigation-panel,
+.control-page #win-map,.control-page #win-fire,.control-page #win-log,
+.control-page #status-bar > .brand,.control-page #status-bar > .spacer,
+.control-page #status-bar > span:not(#status-conn):not(#s-clock) { display:none; }
+.control-page #status-bar { height:72px; padding:0 28px; gap:24px; background:#132027; border-bottom:1px solid var(--line); }
+.control-page .control-brand { display:flex; align-items:center; gap:12px; flex-shrink:0; font-size:13px; color:#b1c3ca; }
+.control-brand strong { font-size:16px; color:#edf5f3; }
+.control-page .page-links { display:flex; align-items:center; align-self:stretch; gap:24px; margin-left:22px; }
+.control-page #status-conn { margin-left:auto; white-space:nowrap; font-size:12px; }
+.control-page #s-clock { font-size:12px; }
+.control-page #btn-estop { font-size:13px; padding:10px 20px; border-radius:9px; background:#49272d; border:1px solid #8d4953; color:#ffbfc3; }
+.control-page #workspace { top:72px; padding:24px 28px; gap:20px; grid-template-columns:minmax(0,1fr) 360px; grid-template-rows:auto minmax(0,1fr); }
+.control-page .control-heading { grid-column:1 / -1; grid-row:1; display:flex; justify-content:space-between; align-items:center; gap:12px; padding:0 2px 4px; }
+.control-heading h1 { font-size:26px; font-weight:600; letter-spacing:1px; color:#eaf1ee; }
+.control-heading p { color:#8ea2aa; font-size:12px; margin-top:8px; }
+.control-owner { font-size:12px; padding:9px 13px; border:1px solid #30454b; border-radius:7px; color:#a0b6be; }
+.control-owner.live { color:#a3e8cd; border-color:#486b5f; }
+.control-page .control-camera { grid-column:1; grid-row:2; display:flex; flex-direction:column; border:1px solid #31434a; border-radius:12px; overflow:hidden; min-height:0; }
+.control-camera-head { height:50px; flex-shrink:0; display:flex; justify-content:space-between; align-items:center; padding:0 17px; gap:12px; background:#192a32; }
+.control-camera-head > div { display:flex; align-items:center; gap:9px; }
+.control-camera-head strong { font-size:13px; font-weight:500; color:#dfede7; }
+.control-camera-head span { font-size:11px; color:#88a59c; }
+#ctl-camera-dot { width:6px; height:6px; background:#657b80; border-radius:50%; }
+#ctl-camera-dot.live { background:#8ae3c5; box-shadow:0 0 9px #8ae3c533; }
+#ctl-video-toggle { border:1px solid #3e555e; background:#20343d; border-radius:6px; padding:7px 10px; font-size:11px; color:#c2d4ce; cursor:pointer; }
+.control-video-body { flex:1; min-height:0; position:relative; background:#070d11; overflow:hidden; }
+#ctl-video { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; display:block; }
+#ctl-video-placeholder { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; flex-direction:column; gap:13px; padding:20px; text-align:center; color:#8ba3ac; }
+#ctl-video-placeholder strong { font-size:15px; color:#b2c7cb; font-weight:500; }
+#ctl-video-placeholder > span:last-child { font-size:11px; line-height:1.7; }
+.camera-placeholder-icon { display:grid; place-items:center; font-size:26px; color:#638c80; width:62px; height:62px; border:1px solid #2f4947; border-radius:18px; margin-bottom:5px; }
+.video-crosshair { position:absolute; left:50%; top:50%; width:24px; height:24px; transform:translate(-50%,-50%); opacity:.28; pointer-events:none; }
+.video-crosshair:before,.video-crosshair:after { content:''; position:absolute; background:#dcf1e6; }
+.video-crosshair:before { left:11px; top:0; height:24px; width:1px; }
+.video-crosshair:after { top:11px; left:0; height:1px; width:24px; }
+.video-motor-badge { position:absolute; bottom:15px; left:16px; padding:7px 11px; border-radius:6px; background:#132027de; color:#a9bdc2; font-size:11px; border:1px solid #354750; }
+.video-motor-badge.live { color:#b2f0d6; border-color:#517c69; }
+.control-camera-foot { height:37px; flex-shrink:0; display:flex; align-items:center; gap:18px; padding:0 16px; font-size:10px; color:#7d97a1; background:#14232a; }
+.control-camera-foot > span:first-child { flex:1; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+#ctl-video-format,#ctl-video-latency { flex-shrink:0; font-family:Consolas,monospace; }
+#ctl-video-fps { min-width:38px; font-family:Consolas,monospace; text-align:right; }
+.control-page #controls-panel { grid-column:2; grid-row:2; display:flex; flex-direction:column; gap:14px; overflow:auto; padding:0 3px 0 0; scrollbar-gutter:stable; }
+.control-page #controls-panel > * { flex-shrink:0; }
+.control-page #drive,.control-page .control-card { position:static; width:auto; margin:0; padding:16px; border:1px solid var(--line); border-radius:12px; background:#17262d; }
+.control-page #drive { gap:12px; }
+.control-page #drive-title,.control-page #gimbal-title { color:#ddebe6; font-size:14px; font-weight:600; }
+.control-page #btn-drive-collapse { display:none; }
+.control-page #drive > .task-help { color:#839fa8; font-size:11px; }
+.control-page #joy-mode button,.control-page #gimbal-mode button { font-size:10px; padding:4px 10px; }
+.control-page #joy-mode button.on,.control-page #gimbal-mode button.on { background:#36594c; color:#a5efd2; }
+.control-page #speed-gears { gap:5px; font-size:11px; }
+.control-page #speed-gears button { padding:5px 10px; font-size:11px; border-radius:5px; }
+.control-page #gear-hint { font-size:10px; color:#8aa99e; }
+.control-page #btn-arm { border-radius:6px; padding:9px 12px; font-size:12px; }
+.control-page #joy-pair,.control-page #gimbal-pair { justify-content:space-evenly; gap:12px; }
+.control-page .joy-pad { width:132px; height:132px; background:#122129; border-color:#3a5159; }
+.control-page #joy-2d { width:170px; height:170px; }
+.control-page #joy-gimbal { width:150px; height:150px; }
+.control-page .joy-knob { background:#7fbda6; box-shadow:0 3px 14px #0003; }
+.control-page .joy-pad.active { border-color:#85cfb2; }
+.control-page .joy-lab { font-size:10px; color:#8fa8b1; margin-top:8px; }
+.control-page #drive-val,.control-page #gimbal-val { font-size:12px; color:#9bd4bd; }
+.control-page #drive-hint,.control-page #gimbal-hint { font-size:10px; color:#8aa1a9; line-height:1.7; white-space:normal; }
+.control-page #gimbal { margin:0; padding:0; border:0; gap:12px; }
+.control-page [hidden] { display:none!important; }
+@media(max-width:1100px) {
+  .control-page #status-bar { gap:16px; padding:0 20px; }
+  .control-page .control-brand > span:last-child,.control-page .brand-divider { display:none; }
+  .control-page .page-links { margin-left:0; gap:18px; }
+  .control-page #workspace { padding:20px; gap:16px; grid-template-columns:minmax(0,1fr) 340px; }
+}
+@media(max-width:760px) {
+  .control-page { overflow:auto; }
+  .control-page #status-bar { height:60px; padding:0 12px; gap:12px; }
+  .control-page .control-brand { gap:7px; }
+  .control-page .control-brand strong { font-size:13px; }
+  .control-page .brand-mark { width:26px; height:29px; font-size:17px; }
+  .control-page .page-links { gap:12px; }
+  .control-page .page-links a { font-size:11px; white-space:nowrap; }
+  .control-page .page-links a[href='/control'],.control-page #s-clock { display:none; }
+  .control-page #status-conn { font-size:10px; }
+  .control-page #conn-text { display:none; }
+  .control-page #btn-estop { padding:8px 12px; font-size:12px; margin-left:auto; }
+  .control-page #workspace { position:relative; top:auto; bottom:auto; margin-top:60px; padding:16px 12px 24px; display:flex; flex-direction:column; gap:14px; }
+  .control-page .control-heading { align-items:flex-start; gap:8px; padding:0; }
+  .control-heading h1 { font-size:22px; }
+  .control-heading p { font-size:10px; max-width:205px; line-height:1.7; }
+  .control-heading .page-eyebrow { font-size:9px; margin-bottom:7px; }
+  .control-owner { font-size:10px; padding:7px 8px; max-width:120px; line-height:1.6; }
+  .control-page .control-camera { position:sticky; top:70px; z-index:5; height:34vh; min-height:240px; flex-shrink:0; }
+  .control-camera-head { height:39px; padding:0 11px; gap:6px; }
+  .control-camera-head strong { font-size:12px; }
+  .control-camera-head span { font-size:10px; }
+  #ctl-video-toggle { font-size:10px; padding:6px 8px; }
+  .control-camera-foot { height:30px; padding:0 10px; gap:9px; font-size:9px; }
+  .video-motor-badge { left:10px; bottom:10px; font-size:9px; padding:5px 8px; }
+  #ctl-video-placeholder { gap:8px; padding:10px; }
+  #ctl-video-placeholder strong { font-size:12px; }
+  .camera-placeholder-icon { width:34px; height:34px; font-size:18px; border-radius:10px; margin:0; }
+  .control-page #controls-panel { display:flex; overflow:visible; padding:0; gap:14px; }
+  .control-page #drive,.control-page .control-card { padding:16px; }
+}
+@media(max-width:370px) {
+  .control-page #status-bar { gap:10px; }
+  .control-page .control-brand strong { display:none; }
+}

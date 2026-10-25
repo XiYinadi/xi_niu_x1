@@ -61,7 +61,7 @@ class MapStore:
             (temp/'map.yaml').write_text(
                 'image: map.pgm\nmode: trinary\n'
                 f'resolution: {resolution:.10g}\norigin: {json.dumps(origin)}\n'
-                'negate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.25\n', encoding='utf-8')
+                'negate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.19\n', encoding='utf-8')
             os.rename(temp, target)
         finally:
             if temp.exists():

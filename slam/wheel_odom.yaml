@@ -1,20 +1,34 @@
 # Encoder channels follow the existing pin 7/8 and pin 11/10 assignments.
 # 2026-10-18: user measured LEFT/RIGHT rear wheel centre spacing as 0.30 m.
-# Initial hand-turned one-revolution calibration: L=106188, R=102626; diameter 0.13m.
-# Ground trials slipped and are excluded. Right wheel was reportedly turned backward.
-# Provisional scale/direction: independent rolling distance validation still required.
+# 2026-10-19: user corrected motor to MD36L, 27:1, rated output speed 260rpm.
+# Encoder resolution remains the previously user-confirmed 500 lines.
+# Calculation assumes encoder on the motor shaft, before the reduction gearbox.
+# x4 decoding: 54000 counts/output revolution; retained wheel diameter 0.13m.
+# Previous measured L=106188/R=102626 counts are NOT used to rescale bad samples.
+# Theoretical scale/direction: independent rolling distance validation required.
 # This flag does NOT unlock autonomous navigation (separate calibration remains false).
 wheel_track_m: 0.30
-counts_per_meter_left: 260005.309185
-counts_per_meter_right: 251283.618304
+counts_per_meter_left: 132221.029645575
+counts_per_meter_right: 132221.029645575
+motor_model: MD36L
+motor_rated_output_rpm: 260
+encoder_lines: 500
+encoder_quadrature_multiplier: 4
+gear_ratio: 27
+wheel_diameter_m: 0.13
 sign_left: 1
 sign_right: -1
-# User confirmed the encoders were previously tested. Retain the independent
-# one-revolution scales above, NOT the inconsistent ground-trial ratio.
-# This enables provisional wheel mapping, not a claim of verified map accuracy.
+# Allows provisional mapping with the confirmed specification, not a claim of
+# verified sampling quality or map accuracy. Phase-loss protection is unchanged.
 calibrated: true
-calibration_basis: manual_one_revolution
+# 相位丢失默认只告警、不锁死 /odom（2026-10-19：开车时采样会漏步，锁死会让
+# 建图一拉摇杆就停）。做标定/验尺度时置 true 可恢复严格锁死。
+phase_fault_fatal: false
+calibration_basis: user_reported_MD36L_500_lines_27_ratio_theoretical
 ground_validation_passed: false
 # Explicit affinity only for the input-only native child, never for ROS/PWM.
 sampler_cpu: 1
+sampler_backend: polling
+# RT scheduling was tested but failed motion quality checks; leave disabled.
+sampler_realtime: false
 max_wheel_speed_mps: 0.5

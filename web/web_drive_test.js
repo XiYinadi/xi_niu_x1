@@ -183,10 +183,14 @@ ok('三个盘的准线类齐全 (joy-2d 要 axis-y+axis-x 两条都亮)',
 
 console.log('=== 0b. 车速档位与检测画面 ===');
 ok('默认低速，未恢复高速', els['gear-low']._attrs['aria-pressed'] === 'true');
-touch(P.thr,0,-1);ok('低速满前进输出 0.5',near(read().l,.5));release(P.thr);
-touch(P.thr,0,1);ok('低速满倒车输出 -0.5',near(read().l,-.5));release(P.thr);
+touch(P.thr,0,-1);ok('低速满前进输出 0.30',near(read().l,.30));release(P.thr);
+touch(P.thr,0,1);ok('低速满倒车输出 -0.30',near(read().l,-.30));release(P.thr);
+for (const amount of [.1,.25,.5,.75]) {
+  touch(P.thr,0,-amount);ok('低速前进线性 '+amount,near(read().l,amount*.3));release(P.thr);
+  touch(P.thr,0,amount);ok('低速倒车线性 '+amount,near(read().l,-amount*.3));release(P.thr);
+}
 touch(P.steer,1,0);ok('低速保留全部转向',near(read().a,-1));release(P.steer);
-document_.fire('keydown',{key:'w',preventDefault(){}});ok('键盘同样限低速',near(read().l,.5));
+document_.fire('keydown',{key:'w',preventDefault(){}});ok('键盘同样限低速',near(read().l,.30));
 els['gear-high'].fire('click');ok('切高速立即清掉按键输入',read().l===0);
 document_.fire('keydown',{key:'w',repeat:true,preventDefault(){}});ok('长按重复事件不会恢复出力',read().l===0);
 document_.fire('keyup',{key:'w'});
@@ -757,6 +761,23 @@ ok('急停在固定顶栏，独立于可折叠驾驶区', HTML.indexOf('id="btn-
 emitted.length = 0;
 els['btn-estop'].fire('click');
 ok('折叠后急停仍发出 estop', emitted.some(e => e.ev === 'motor_control' && e.p.action === 'estop'));
+
+console.log('=== 15. 文本输入与离开页面 ===');
+document_.fire('keydown', { key:'w', repeat:false, preventDefault(){} });
+ok('前置：非输入框的 W 仍能驾驶', read().l > 0);
+document_.fire('focusin', { target:{tagName:'INPUT'} });
+ok('聚焦地图名立即清掉已按住的驾驶键', read().l === 0);
+for (const target of [{tagName:'INPUT'}, {tagName:'TEXTAREA'}, {tagName:'SELECT'}, {isContentEditable:true}]) {
+  document_.fire('keydown', { key:'w', repeat:false, target, preventDefault(){} });
+  ok('编辑字段不接收驾驶键 '+(target.tagName || 'contenteditable'), read().l === 0);
+}
+touch(P.thr, 0, -1);
+emitted.length = 0;
+window_.fire('pagehide');
+ok('离开页面立即补发电机零速', emitted.some(e=>e.ev==='motor_control' && e.p.action==='vel' && e.p.linear===0 && e.p.angular===0));
+ok('离开页面停止发送定时器', !timers.some(t=>t.ms===16 && t.alive));
+window_.fire('pageshow');
+ok('返回页面恢复定时器但不恢复旧指令', timers.filter(t=>t.ms===16 && t.alive).length===1 && read().l===0);
 
 console.log('\n' + pass + ' 通过, ' + fail + ' 失败');
 console.log('⚠️ 真机上仍要手验一次: 按下摇杆不放 → 点切换 → 指令必须立刻归零。');

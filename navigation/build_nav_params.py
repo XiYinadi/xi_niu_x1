@@ -3,11 +3,15 @@ import math
 from pathlib import Path
 import yaml
 from ament_index_python.packages import get_package_share_directory
+from navigation_core import footprint_points
+from navigation_drive import is_trial, validate_navigation
 
 
 def build():
     here = Path(__file__).resolve().parent
     cfg = yaml.safe_load((here/'navigation_calibration.yaml').read_text())
+    trial=is_trial(cfg)
+    if trial:validate_navigation(cfg)
     share = Path(get_package_share_directory('nav2_bringup'))
     data = yaml.safe_load((share/'params'/'nav2_params.yaml').read_text())
     for section in data.values():
@@ -17,31 +21,32 @@ def build():
     amcl.update(base_frame_id='base_link', odom_frame_id='odom', global_frame_id='map',
                 robot_model_type='nav2_amcl::DifferentialMotionModel',
                 scan_topic='/scan', set_initial_pose=False,
-                update_min_d=0.02, update_min_a=0.03, transform_tolerance=0.5)
+                update_min_d=0.02, update_min_a=0.03, transform_tolerance=0.5,
+                recovery_alpha_slow=0.001, recovery_alpha_fast=0.1)
     # DifferentialMotionModel models odometry noise, not drive commands.
-    # Conservative placeholder geometry is for preview only; motion remains gated.
-    length, width = cfg.get('length_m') or 0.7, cfg.get('width_m') or 0.7
-    footprint = str([[length/2, width/2], [length/2, -width/2],
-                     [-length/2, -width/2], [-length/2, width/2]])
+    # Reference changes must move the footprint as well as the laser TF.
+    footprint = str(footprint_points(cfg))
     for key in ('local_costmap', 'global_costmap'):
         p = data[key][key]['ros__parameters']
-        p.update(robot_base_frame='base_link', footprint=footprint, resolution=0.05,
+        p.update(use_sim_time=False, robot_base_frame='base_link', footprint=footprint, resolution=0.05,
                  transform_tolerance=0.5)
         p.pop('robot_radius', None)
         # A 2D laser cannot populate a useful volumetric voxel layer here.
         p['plugins'] = (['static_layer'] if key == 'global_costmap' else []) + ['obstacle_layer', 'inflation_layer']
         p['obstacle_layer'] = dict(plugin='nav2_costmap_2d::ObstacleLayer', enabled=True,
             observation_sources='scan', scan=dict(topic='/scan', data_type='LaserScan',
+            min_obstacle_height=0.0, max_obstacle_height=2.0,
             marking=True, clearing=True, obstacle_min_range=0.2, obstacle_max_range=3.0,
             raytrace_min_range=0.2, raytrace_max_range=4.0))
         p['inflation_layer'].update(inflation_radius=0.45, cost_scaling_factor=3.0)
         if key == 'global_costmap':
             p['static_layer'].update(map_subscribe_transient_local=True,subscribe_to_updates=True)
-    radius = (cfg.get('wheelbase_m') or 0.4) / math.tan(cfg.get('max_steering_rad') or 0.4)
+    planning_steering=cfg['trial_max_steering_rad']*.95 if trial else (cfg.get('max_steering_rad') or .4)
+    radius = (cfg.get('wheelbase_m') or 0.4) / math.tan(planning_steering)
     planner = data['planner_server']['ros__parameters']
     planner['planner_plugins'] = ['GridBased']
     planner['GridBased'] = dict(plugin='nav2_smac_planner/SmacPlannerHybrid',
-        tolerance=0.15, downsample_costmap=False, allow_unknown=False,
+        tolerance=0.15, downsample_costmap=False, allow_unknown=True,
         max_iterations=100000, max_planning_time=3.0, motion_model_for_search='DUBIN',
         angle_quantization_bins=72, minimum_turning_radius=radius,
         analytic_expansion_ratio=3.5, analytic_expansion_max_length=max(3.0, 4*radius))
@@ -59,15 +64,24 @@ def build():
         transform_tolerance=0.3)
     controller['general_goal_checker']['xy_goal_tolerance'] = 0.15
     controller['general_goal_checker']['yaw_goal_tolerance'] = 0.35
+    if trial:
+        controller['general_goal_checker']['xy_goal_tolerance']=.08
+        # Default 0.5m/10s cannot be met by this 0.05m/s profile at startup.
+        controller['progress_checker'].update(required_movement_radius=.03,movement_time_allowance=8.0)
+        smoother=data['velocity_smoother']['ros__parameters']
+        max_w=cfg['max_speed_mps']*math.tan(cfg['trial_max_steering_rad'])/cfg['wheelbase_m']
+        smoother.update(smoothing_frequency=20.0,feedback='OPEN_LOOP',scale_velocities=True,
+            max_velocity=[cfg['max_speed_mps'],0.,max_w],min_velocity=[0.,0.,-max_w],
+            max_accel=[.04,0.,.10],max_decel=[-.08,0.,-.15],velocity_timeout=.2)
     # No spin/backup recovery: both assume capabilities not established on this chassis.
     bt = here/'navigate_no_recovery.xml'
-    bt.write_text('''<root main_tree_to_execute="MainTree">
-<BehaviorTree ID="MainTree"><PipelineSequence name="Navigate">
-<RateController hz="1.0"><ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/></RateController>
-<FollowPath path="{path}" controller_id="FollowPath"/>
-</PipelineSequence></BehaviorTree></root>\n''')
+    from navigation_tree import single_goal_tree
+    bt.write_text(single_goal_tree(trial))
     data['bt_navigator']['ros__parameters'].update(
         robot_base_frame='base_link', global_frame='map', odom_topic='/odom',
+        # Humble's 20ms action ACK default intermittently expires under load.
+        # Milliseconds; independent of the actuator/sensor stop watchdogs.
+        default_server_timeout=500,
         default_nav_to_pose_bt_xml=str(bt))
     multi = here/'navigate_through_no_recovery.xml'
     multi.write_text('''<root main_tree_to_execute="MainTree">

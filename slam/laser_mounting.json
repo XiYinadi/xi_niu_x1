@@ -1,0 +1,8 @@
+{
+  "x_m": 0.40,
+  "y_m": 0.0,
+  "z_m": 0.10,
+  "yaw_rad": -3.141592653589793,
+  "yaw_evidence": "2026-10-23: after operator secured disturbed mounting, target was placed on true vehicle-forward line. Target at laser bearing 180.0deg (near/far) and 179.75deg (near/removed); background rotation 0.0deg, 88-89pct rays agree within 8cm. Set body-to-laser yaw -180deg; estimated heading uncertainty about 2deg. Marker distances were approximate; this is not range-scale or driving calibration.",
+  "position_note": "2026-10-24 operator measured laser center 40cm forward of rear-axle midpoint, approximately centered laterally. base_link is rear-axle midpoint. Forward extent including housing/support reported approximately 40cm; height remains nominal and unmeasured."
+}

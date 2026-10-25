@@ -1,0 +1,256 @@
+/* Dedicated mapping workspace. The console keeps its established layout. */
+.mapping-page { --bg:#10191e; --accent:#8ae3c5; --dim:#94a9b0; --line:#2b3b42; background:#10191e; }
+.mapping-page .mapping-only { display:block; }
+.mapping-page .console-only,
+.mapping-page .control-intro,
+.mapping-page #gimbal,
+.mapping-page #autonomy-panel,
+.mapping-page #win-fire,
+.mapping-page #status-bar > .brand,
+.mapping-page #status-bar > span:not(#status-conn):not(.spacer):not(#s-clock),
+.mapping-page #hud { display:none; }
+.mapping-page #status-bar { height:72px; padding:0 28px; gap:24px; background:#132027; border-bottom:1px solid var(--line); }
+.mapping-page .mapping-brand { display:flex; align-items:center; gap:12px; flex-shrink:0; font-size:13px; color:#b1c3ca; }
+.mapping-brand strong { font-size:16px; color:#edf5f3; letter-spacing:.5px; }
+.brand-mark { display:grid; place-items:center; width:32px; height:34px; border:1px solid #568d7b; border-radius:10px 10px 10px 3px; color:#a0ecd1; font-size:20px; font-weight:800; }
+.brand-divider { height:18px; width:1px; background:#3a4a50; margin:0 3px; }
+.mapping-page .page-links { display:flex; align-self:stretch; gap:24px; align-items:center; margin-left:22px; }
+.console-page .page-links { display:flex; align-self:stretch; align-items:center; gap:20px; flex-shrink:0; }
+.page-links a { display:flex; align-items:center; height:100%; color:#91a6ad; text-decoration:none; font-size:13px; border-bottom:2px solid transparent; transition:color .15s; }
+.page-links a:hover { color:#edf5f3; }
+.page-links a[aria-current="page"] { border-bottom-color:var(--accent); color:var(--accent); }
+.mapping-page #status-conn { margin-left:auto; color:#b4c6cb; font-size:12px; white-space:nowrap; }
+.mapping-page #status-bar > .spacer { display:none; }
+.mapping-page #s-clock { font-size:12px; }
+.mapping-page #btn-estop { font-size:13px; padding:10px 20px; border-radius:9px; background:#49272d; border:1px solid #8d4953; color:#ffbfc3; }
+.mapping-page #btn-estop:hover:not(:disabled) { background:#79323e; color:#fff; }
+.mapping-page #workspace { top:72px; padding:24px 28px 20px; gap:16px 20px; grid-template-columns:minmax(0,1fr) 360px; grid-template-rows:auto minmax(280px,1fr) auto auto; }
+.mapping-page .mapping-heading { grid-column:1 / -1; grid-row:1; display:flex; align-items:center; justify-content:space-between; padding:0 2px 7px; gap:16px; }
+.page-eyebrow { font:10px/1.2 'Segoe UI',sans-serif; letter-spacing:2.4px; color:#7cae9d; margin-bottom:10px; }
+.mapping-heading h1 { font-size:26px; font-weight:600; letter-spacing:1px; color:#eaf1ee; }
+.mapping-heading p { color:#8ea2aa; font-size:12px; margin-top:8px; }
+.mobile-feed { display:none; }
+.mapping-session { display:flex; gap:8px; align-items:center; font-size:12px; color:#a0b6be; padding:9px 13px; border:1px solid #30454b; border-radius:7px; white-space:nowrap; }
+.mapping-session i { width:6px; height:6px; border-radius:50%; background:#73868e; }
+.mapping-session.live i { background:#8ae3c5; box-shadow:0 0 10px #8ae3c533; }
+.mapping-page #win-map { grid-column:1; grid-row:2; border-radius:12px; border-color:#31434a; min-height:280px; }
+.mapping-page #win-map .win-title { height:49px; padding:0 17px; background:#192a32; }
+.mapping-page #win-map .t { font-size:13px; letter-spacing:.4px; }
+.mapping-page #win-map .btn { border-radius:6px; width:31px; height:29px; padding:0; font-size:16px; }
+.mapping-page #win-map .btn.active { background:#2a4b42; color:var(--accent); }
+.mapping-page #win-map #mp-camera-toggle { width:auto; padding:0 9px; font-size:11px; }
+.mapping-page .mapping-camera { position:absolute; top:12px; left:12px; z-index:8; width:264px; max-width:calc(100% - 24px); border:1px solid #46615e; border-radius:9px; overflow:hidden; box-shadow:0 6px 24px #0006; background:#101b22; }
+.mapping-camera > header { height:32px; display:flex; align-items:center; gap:10px; padding:0 9px; background:#1c3037; }
+.mapping-camera > header strong { font-size:11px; font-weight:500; color:#deeee7; }
+.mapping-camera > header span { font-size:10px; color:#93c5b4; margin-left:auto; }
+#mp-camera-close { font:18px/1 'Segoe UI',sans-serif; width:25px; height:26px; cursor:pointer; border:0; border-radius:4px; background:transparent; color:#c8d9d8; }
+#mp-camera-close:hover { background:#3c514f; }
+.camera-preview-body { position:relative; width:100%; aspect-ratio:4 / 3; background:#080f14; }
+#mp-camera-image { display:block; width:100%; height:100%; object-fit:contain; position:absolute; inset:0; }
+#mp-camera-message { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; padding:12px; color:#9ab0b9; text-align:center; font-size:11px; line-height:1.6; }
+.camera-visible .map-guide { display:none!important; }
+.mapping-page .map-live-label { color:#78968e; font-size:11px; margin-left:4px; }
+.mapping-page #map-body { background:#0a0a14; }
+.mapping-page #c { width:100%; height:100%; display:block; touch-action:none; cursor:grab; }
+.mapping-page #c:active { cursor:grabbing; }
+.mapping-page .map-guide { position:absolute; top:14px; left:16px; font-size:10px; color:#83959f; pointer-events:none; padding:7px 9px; background:#132027c9; border:1px solid #293a4466; border-radius:6px; }
+.map-guide span { color:#536772; margin:0 8px; }
+.mapping-page #legend { left:16px; bottom:17px; gap:13px; background:#132027e6; padding:8px 12px; border-radius:7px; font-size:10px; }
+.mapping-page #legend i { width:7px; height:7px; }
+.mapping-page .map-position { position:absolute; bottom:17px; right:16px; display:flex; gap:24px; padding:10px 17px; border-radius:8px; background:#15232ce8; border:1px solid #31414b; pointer-events:none; }
+.map-position div { min-width:54px; display:flex; flex-direction:column; gap:6px; }
+.map-position span { color:#8ba2ad; font-size:9px; letter-spacing:.4px; }
+.map-position strong { font:15px/1.1 Consolas,monospace; color:#c8e6dd; font-weight:400; }
+.map-position.stale strong { color:#6c7d86; }
+.mapping-page .map-position { flex-direction:column; gap:10px; min-width:256px; }
+.map-position .map-pose-row,.map-position .map-accel-row { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:18px; min-width:0; }
+.map-position .map-pose-row > div,.map-position .map-accel-row > div { min-width:0; }
+.map-position .map-accel-heading { display:flex; flex-direction:row; align-items:center; justify-content:space-between; gap:8px; min-width:0; padding-top:10px; border-top:1px solid #35434a; }
+.map-accel-heading small { font-size:9px; color:#90a6ae; }
+.map-accel-heading small.live { color:#8ae3c5; }
+.map-accel-heading small.warning { color:#dbb586; }
+.map-position .map-accel-row strong { font-size:14px; }
+.map-position .map-accel-note { display:flex; flex-direction:row; justify-content:space-between; gap:10px; min-width:0; }
+.map-accel-note span { font-size:9px; }
+.map-accel-note b { color:#b1c9c0; font-weight:400; font-family:Consolas,monospace; }
+/* Pose and inertial data have independent freshness; a lost odom does not hide a live IMU. */
+.map-position.stale .map-accel-row strong { color:#c8e6dd; }
+.mapping-page #map-empty { padding-bottom:80px; }
+.mapping-page #map-empty strong { font-size:19px; }
+.mapping-page #map-empty span { font-size:12px; }
+.mapping-page #controls-panel { grid-column:2; grid-row:2 / 5; display:flex; flex-direction:column; gap:14px; padding:0 3px 0 0; overflow:auto; scrollbar-gutter:stable; }
+.mapping-page #controls-panel > * { flex-shrink:0; }
+.mapping-page .mapping-health { order:0; border:1px solid var(--line); background:#17262d; padding:16px; border-radius:12px; }
+.mapping-page .mapping-odometry { grid-column:1; grid-row:3; display:grid; grid-template-columns:1fr auto; column-gap:16px; border:1px solid #46665c; background:#17262d; padding:14px 16px; border-radius:12px; }
+.mapping-odometry .card-heading { justify-content:flex-start; gap:14px; }
+.mapping-odometry .odometry-toolbar { grid-column:2; grid-row:1 / 3; margin:0; }
+.mapping-odometry .odometry-grid,.mapping-odometry .odometry-note,.mapping-odometry .odometry-raw { grid-column:1 / -1; }
+.odometry-source { color:#91b4a8; font-size:10px; margin-top:8px; }
+.odometry-toolbar { display:flex; gap:8px; align-items:center; justify-content:space-between; margin:12px 0; font-size:11px; color:#aac1b9; }
+#mp-odometry-zero { padding:7px 9px; border:1px solid #567e6e; border-radius:6px; background:#28463b; color:#c4f1dc; font-size:11px; cursor:pointer; }
+#mp-odometry-zero:disabled { opacity:.45; cursor:default; }
+.odometry-grid { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:14px 8px; margin-top:14px; }
+.odometry-grid > div { min-width:0; display:flex; flex-direction:column; gap:7px; }
+.odometry-grid span { color:#95afa6; font-size:10px; }
+.odometry-grid strong { color:#b8efda; font:20px/1.2 Consolas,monospace; overflow-wrap:anywhere; }
+.odometry-note { color:#92aaa2; font-size:10px; line-height:1.7; margin-top:12px; }
+.odometry-raw { margin-top:10px; color:#92aaa2; font-size:10px; line-height:1.8; }
+.odometry-raw summary { cursor:pointer; }
+.odometry-raw div { margin-top:6px; font-family:Consolas,monospace; }
+.odometry-raw small { overflow-wrap:anywhere; }
+.card-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.mapping-page h2 { font-size:14px; font-weight:600; color:#ddebe6; }
+.status-pill { background:#25343c; border-radius:5px; color:#a6b6be; padding:5px 9px; font-size:11px; white-space:nowrap; }
+.status-pill.live { color:#99e9ca; background:#244539; }
+.status-pill.warning { color:#efc282; background:#4c3c27; }
+.mapping-health > p { font-size:11px; color:#8ea7af; margin-top:10px; line-height:1.6; min-height:18px; }
+.sensor-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); margin-top:15px; padding:0 0 15px; border-bottom:1px solid #2b3b42; }
+.sensor-grid > div { display:flex; flex-direction:column; gap:7px; border-right:1px solid #2c3b42; padding:0 12px; }
+.sensor-grid > div:first-child { padding-left:0; }
+.sensor-grid > div:last-child { border-right:0; padding-right:0; }
+.sensor-label { font-size:10px; color:#9bb0b8; display:flex; align-items:center; gap:5px; white-space:nowrap; }
+.sensor-label i { width:5px; height:5px; border-radius:50%; background:#64747d; }
+.sensor-label i.live { background:#8ae3c5; }
+.sensor-label i.warning { background:#e0b075; }
+.sensor-grid strong { font-size:12px; font-weight:500; color:#d4e5df; }
+.sensor-grid small { font:10px/1.2 Consolas,monospace; color:#738d97; }
+.motor-summary { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:12px; font-size:11px; color:#8ca4ae; }
+.motor-summary strong { font-size:11px; font-weight:500; color:#a7b8be; }
+.motor-summary strong.live { color:#9fe8ce; }
+.motor-summary strong.warning { color:#efc282; }
+.mapping-page #mp-mode-controls { margin-top:14px; padding-top:12px; border-top:1px solid #34464b; }
+.mapping-page #mp-mode-controls[hidden],.mapping-page #mp-return-mapping[hidden] { display:none!important; }
+.mapping-page #mp-mode-note { color:#b7cbbf; font-size:11px; line-height:1.7; margin:0 0 10px; }
+.mapping-page #mp-return-mapping { width:100%; padding:9px 10px; border:1px solid #5f8a75; border-radius:6px; background:#28483b; color:#c0edda; font-size:12px; cursor:pointer; }
+.mapping-page #mp-return-mapping:disabled { opacity:.5; cursor:default; }
+.mapping-page #navigation-panel { order:2; }
+.mapping-page #mapping-actions { margin:0; padding:16px; border-radius:12px; }
+.mapping-page #mapping-actions > summary { display:none; }
+.mapping-page .mapping-action-hint { font-size:11px; line-height:1.7; color:#91a7af; margin-top:9px; }
+.mapping-page #mapping-actions .nav-row { margin-top:12px; }
+.mapping-page #mapping-actions .nav-row:empty { display:none; }
+.mapping-page #btn-map { width:100%; margin:0; padding:11px; font-size:13px; border:1px solid #3b7562; background:#8ae3c5; color:#112c22; font-weight:600; }
+.mapping-page #btn-map.on { background:#213e34; color:#a7e8cf; border-color:#3f685b; }
+.mapping-page #btn-map.partial { background:#4c3c27; color:#efc282; border-color:#77603e; }
+.mapping-page #btn-map:disabled { opacity:.45; }
+.mapping-page #win-map #btn-map { width:auto; min-width:72px; margin:0 7px 0 0; padding:6px 10px; font-size:11px; border-radius:6px; font-weight:500; }
+.mapping-page .save-label { margin-top:15px; font-size:11px; color:#a0b4bc; }
+.mapping-page #mapping-actions .save-map-row { flex-wrap:nowrap; margin-top:7px; gap:7px; }
+.mapping-page #nav-name { width:0; padding:9px 10px; font-size:12px; border-radius:6px; outline:none; }
+.mapping-page #nav-name:focus { border-color:#76b8a1; box-shadow:0 0 0 2px #76b8a114; }
+.mapping-page #nav-save { flex-shrink:0; border:1px solid #3e555e; background:#20343d; padding:9px 12px; font-size:11px; border-radius:6px; }
+.mapping-page .save-feedback { font-size:10px; color:#7e98a2; margin-top:8px; line-height:1.6; overflow-wrap:anywhere; }
+.save-feedback.success { color:#9fe8ce; }
+.save-feedback.error { color:#f4b2a1; }
+.mapping-page .map-editor-link { font-size:11px; color:#a7e5cf; margin-top:12px; text-decoration:none; line-height:1.7; }
+.mapping-page #drive { order:1; margin:0; padding:16px; border-radius:12px; gap:12px; }
+.mapping-page #drive-title { font-size:14px; }
+.mapping-page #drive-head-right { gap:7px; }
+.mapping-page #btn-drive-collapse { font-size:10px; padding:5px 6px; }
+.mapping-page #joy-mode button { font-size:10px; padding:4px 10px; }
+.mapping-page #joy-mode button.on { background:#36594c; color:#a5efd2; }
+.mapping-page #drive > .task-help { font-size:11px; color:#839fa8; }
+.mapping-page #speed-gears { gap:5px; font-size:11px; }
+.mapping-page #speed-gears button { font-size:11px; padding:6px 15px; border-radius:6px; }
+.mapping-page #speed-gears button.on { color:#a9ecd5; background:#2b4e41; border-color:#4d7765; }
+.mapping-page #gear-hint { display:none; }
+.mapping-page #btn-arm { font-size:12px; padding:10px; border:1px solid #3e535b; background:#21353e; color:#cfdfdf; border-radius:7px; }
+.mapping-page #btn-arm.armed { background:#264c3b; border-color:#56876d; color:#acf1cd; }
+.mapping-page #joy-pair { gap:14px; }
+.mapping-page .joy-pad { width:132px; height:132px; background:radial-gradient(circle,transparent 0 32%,#527b6940 32% 33%,transparent 33% 65%,#527b6928 65% 66%,transparent 66%),#122229; border-color:#365148; }
+.mapping-page #joy-2d { width:164px; height:164px; }
+.mapping-page .joy-knob { width:42px; height:42px; margin:-21px 0 0 -21px; background:#8ae3c5; box-shadow:0 0 20px #8ae3c518,inset 0 1px 2px #ffffff66; }
+.mapping-page .joy-lab { font-size:10px; margin-top:6px; }
+.mapping-page #drive-val { font:12px/1.6 Consolas,'Segoe UI',monospace; color:#a2d9c9; background:#122129; padding:8px; border-radius:6px; }
+.mapping-page #drive-hint { font-size:10px; line-height:1.5; }
+.mapping-page #win-log { grid-column:1; grid-row:4; min-height:42px; height:180px; border-radius:10px; }
+.mapping-page #win-log.collapsed { height:42px; }
+.mapping-page #win-log .win-title { min-height:40px; background:#17262d; }
+.mapping-page #win-log .t { font-size:11px; color:#9bb0b9; }
+.mapping-page #win-map.full { inset:72px 0 0; z-index:25; height:auto; border-radius:0; }
+.mapping-page #win-map.full #legend { bottom:17px; }
+@media (max-width:1120px) {
+  .mapping-page #status-bar { padding:0 18px; gap:18px; }
+  .mapping-page .mapping-brand > span:last-child { display:none; }
+  .mapping-page .brand-divider { display:none; }
+  .mapping-page #workspace { padding:20px 18px 16px; grid-template-columns:minmax(0,1fr) 330px; gap:14px; }
+  .mapping-page #s-clock { display:none; }
+  .mapping-page #legend { gap:8px; padding:7px 9px; }
+  .mapping-page .map-position { gap:14px; right:12px; bottom:57px; padding:10px 12px; }
+  .mapping-page .joy-pad { width:122px; height:122px; }
+  .mapping-page #joy-2d { width:154px; height:154px; }
+}
+@media (max-width:760px) {
+  .console-page .page-links { gap:10px; }
+  .console-page .page-links a { font-size:11px; }
+  .console-page .page-links a[href="/console"] { display:none; }
+  .mapping-page { overflow:auto; }
+  .mapping-page #status-bar { height:60px; padding:0 12px; gap:10px; }
+  .mapping-page .mapping-brand { gap:8px; }
+  .mapping-page .mapping-brand strong { font-size:14px; }
+  .brand-mark { width:25px; height:28px; font-size:17px; border-radius:7px 7px 7px 2px; }
+  .mapping-page .page-links { margin-left:0; gap:12px; }
+  .mapping-page .page-links a { font-size:11px; }
+  .mapping-page .page-links > a:first-child { display:none; }
+  .mapping-page #status-conn { margin-left:auto; font-size:10px; gap:4px; }
+  .mapping-page #btn-estop { font-size:12px; padding:8px 12px; margin-left:0; }
+  .mapping-page #workspace { position:relative; top:auto; margin-top:60px; padding:18px 12px 300px; display:flex; flex-direction:column; gap:14px; }
+  .mapping-page .mapping-heading { order:0; padding:0 2px 3px; align-items:flex-start; }
+  .mapping-heading h1 { font-size:22px; letter-spacing:.4px; }
+  .mapping-heading p { font-size:11px; line-height:1.6; max-width:240px; }
+  .mapping-page .mobile-feed { display:block; color:#95cab8; font-size:10px; line-height:1.6; margin-top:7px; }
+  .page-eyebrow { font-size:9px; letter-spacing:1.7px; margin-bottom:8px; }
+  .mapping-page .mapping-session { font-size:10px; padding:6px 8px; gap:5px; margin-top:2px; }
+  .mapping-page #win-map { order:1; height:clamp(250px,calc(100svh - 465px),420px); min-height:250px; flex:none; }
+  .mapping-page #win-map .win-title { height:44px; padding:0 10px; gap:7px; }
+  .mapping-page #win-map .t { font-size:12px; }
+  .mapping-page .map-live-label { display:none; }
+  .mapping-page #win-map .btn { width:27px; height:27px; font-size:14px; }
+  .mapping-page #win-map #mp-camera-toggle { padding:0 6px; font-size:10px; }
+  .mapping-page .mapping-camera { top:8px; left:8px; width:140px; }
+  .mapping-camera > header { height:27px; gap:4px; padding:0 6px; }
+  .mapping-camera > header strong,.mapping-camera > header span { font-size:9px; }
+  #mp-camera-close { width:20px; height:24px; }
+  #mp-camera-message { padding:8px; font-size:10px; }
+  .mapping-page .camera-visible .map-position { bottom:8px; gap:6px; }
+  .mapping-page .camera-visible #legend { display:none; }
+  .mapping-page #controls-panel { order:2; overflow:visible; padding:0; display:flex; gap:12px; }
+  .mapping-page .mapping-odometry { order:2; display:block; padding:15px; }
+  .mapping-odometry .odometry-toolbar { margin:12px 0; }
+  .mapping-odometry .odometry-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
+  .mapping-page #win-log { order:3; height:180px; }
+  .mapping-page #win-log.collapsed { height:42px; }
+  .mapping-page .mapping-health { padding:15px; }
+  .mapping-page .mapping-heading .mapping-session { max-width:95px; white-space:normal; line-height:1.5; }
+  .mapping-page #drive { position:fixed; left:12px; right:12px; bottom:max(10px,env(safe-area-inset-bottom)); z-index:20; padding:12px 16px; display:grid; grid-template-columns:1fr auto; gap:7px 10px; box-shadow:0 -8px 28px #0007; background:#17262df5; backdrop-filter:blur(12px); }
+  .mapping-page #drive-head { grid-column:1 / -1; }
+  .mapping-page #drive > .task-help,.mapping-page #drive-hint { display:none; }
+  .mapping-page #speed-gears { grid-column:1; grid-row:2; }
+  .mapping-page #speed-gears > span { display:none; }
+  .mapping-page #drive-btns { grid-column:2; grid-row:2; }
+  .mapping-page #btn-arm { padding:7px 16px; font-size:11px; }
+  .mapping-page #joy-pair,.mapping-page #joy-single { grid-column:1 / -1; grid-row:3; }
+  .mapping-page #drive-val { grid-column:1 / -1; grid-row:4; padding:5px; font-size:11px; }
+  .mapping-page .joy-pad { width:112px; height:112px; }
+  .mapping-page #joy-2d { width:128px; height:128px; }
+  .mapping-page .joy-knob { width:36px; height:36px; margin:-18px 0 0 -18px; }
+  .mapping-page .joy-lab { font-size:9px; margin-top:3px; }
+  .mapping-page #drive #joy-pair { gap:20px; }
+  .mapping-page #drive.collapsed { display:flex; gap:0; }
+  .mapping-page .map-guide { top:10px; left:10px; font-size:9px; }
+  .mapping-page .map-position { bottom:47px; right:10px; padding:8px 12px; gap:16px; }
+  .map-position strong { font-size:13px; }
+  .mapping-page #legend { left:10px; bottom:10px; padding:7px 9px; font-size:9px; gap:11px; }
+  .mapping-page #win-map.full { inset:60px 0 0; height:auto; }
+}
+@media (max-width:370px) {
+  .mapping-page .mapping-brand strong { display:none; }
+  .mapping-page #drive #joy-pair { gap:14px; }
+}
+@media (max-width:760px) and (max-height:720px) {
+  .mapping-page .mapping-heading { display:none; }
+  .mapping-page #win-map { min-height:220px; height:calc(100svh - 380px); }
+}
+@media (prefers-reduced-motion:reduce) {
+  .mapping-page *, .mapping-page *::before, .mapping-page *::after { animation:none!important; transition:none!important; }
+}

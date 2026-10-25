@@ -40,3 +40,18 @@ web/slam_viz.py.bak-*
 *.bak4-*
 *.before_affinity
 slam/encoder_sampler_poll
+
+# 2026-10-25: 导航栈落地时的现场产物（体积大/可再生成，不进库）
+backups/
+data/
+diagnostics/
+stage1/*.jsonl
+stage1/*.json
+stage1/*.yaml
+stage1/*.bak-*
+stage1/latest_backup.txt
+slam/encoder_sampler.*
+slam/encoder_sampler_poll.*
+slam/*.before_*
+web/*.bak-*
+navigation/cyclonedds_local.xml

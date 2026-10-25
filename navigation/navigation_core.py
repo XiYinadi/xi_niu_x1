@@ -2,6 +2,20 @@
 import math
 
 
+def footprint_points(config):
+    """Rectangle in base_link axes, including a rear-axle reference if measured."""
+    length,width=config.get('length_m') or .7,config.get('width_m') or .7
+    front=rear=length/2
+    if config.get('base_reference') == 'rear_axle_midpoint':
+        front,rear=config.get('front_extent_m'),config.get('rear_extent_m')
+    for value in (length,width,front,rear):
+        if type(value) not in (int,float) or not math.isfinite(value) or value<=0:
+            raise ValueError('车体轮廓必须包含有效的前伸、后伸和宽度')
+    if not math.isclose(front+rear,length,rel_tol=1e-6,abs_tol=1e-6):
+        raise ValueError('车体前伸与后伸之和必须等于整车长度')
+    return [[front,width/2],[front,-width/2],[-rear,-width/2],[-rear,width/2]]
+
+
 def validate_calibration(config):
     if config.get('calibrated') is not True:
         raise ValueError('底盘尺寸、转角与速度尚未实测标定；当前只允许定位和路径预览')
@@ -17,6 +31,7 @@ def validate_calibration(config):
         raise ValueError('steering_sign 必须是 -1 或 1')
     if config['max_speed_mps'] > config['full_throttle_mps']:
         raise ValueError('导航限速不能超过标定满油门速度')
+    footprint_points(config)
 
 
 def twist_to_joystick(v, omega, config):

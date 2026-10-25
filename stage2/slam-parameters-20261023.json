@@ -1,0 +1,7 @@
+{
+  "do_loop_closing": true,
+  "resolution": 0.05,
+  "minimum_travel_distance": 0.05,
+  "minimum_travel_heading": 0.05,
+  "loop_search_maximum_distance": 3.0
+}

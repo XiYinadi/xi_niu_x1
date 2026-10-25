@@ -15,7 +15,8 @@ fire_detect.py — 犀牛派 火焰/烟雾检测(本地 VLM 直判,独立进程)
   FIRE_DETECT_DEVICE       相机设备       (默认 /dev/video2)
   FIRE_DETECT_WIDTH        流目标宽度     (默认 640,保持宽高比)
   FIRE_DETECT_QUALITY      JPEG 质量      (默认 70)
-  FIRE_DETECT_FPS          捕获帧率       (默认 10)
+  FIRE_DETECT_FPS          捕获帧率       (默认 30)
+  FIRE_DETECT_CAPTURE_WIDTH/HEIGHT  设备采集尺寸 (默认 1280x720)
   FIRE_DETECT_PORT         标注流端口     (默认 5812)
   FIRE_DETECT_INTERVAL     判定间隔秒     (默认 3.0)
   FIRE_DETECT_CONF         告警置信度阈值 (默认 0.5)
@@ -47,7 +48,9 @@ from local_model import completion
 DEVICE = os.environ.get("FIRE_DETECT_DEVICE", "/dev/video2")
 STREAM_WIDTH = int(os.environ.get("FIRE_DETECT_WIDTH", 640))
 QUALITY = int(os.environ.get("FIRE_DETECT_QUALITY", 70))
-FPS = int(os.environ.get("FIRE_DETECT_FPS", 10))
+FPS = max(1, min(60, int(os.environ.get("FIRE_DETECT_FPS", 30))))
+CAPTURE_WIDTH = int(os.environ.get("FIRE_DETECT_CAPTURE_WIDTH", 1280))
+CAPTURE_HEIGHT = int(os.environ.get("FIRE_DETECT_CAPTURE_HEIGHT", 720))
 HOST = os.environ.get("FIRE_DETECT_HOST", "0.0.0.0")
 PORT = int(os.environ.get("FIRE_DETECT_PORT", "5812"))
 INTERVAL = float(os.environ.get("FIRE_DETECT_INTERVAL", "3.0"))
@@ -75,6 +78,8 @@ _latest_bgr_t = 0.0
 _inspection_snapshot = None   # Exact submitted frame paired with its verdict.
 _cap_count = 0                # 帧计数(用于 MJPEG 去重编码)
 _capture_ok = False
+_capture_fps = 0.0
+_capture_config = {}
 _verdict = {                  # 最近一次 VLM 判定
     "fire": False,
     "confidence": 0.0,
@@ -87,21 +92,35 @@ _verdict = {                  # 最近一次 VLM 判定
 
 # ── 相机捕获线程 ──────────────────────────────────────────────────
 def capture_loop():
-    global _latest_bgr, _latest_bgr_t, _cap_count, _capture_ok
+    global _latest_bgr, _latest_bgr_t, _cap_count, _capture_ok, _capture_fps, _capture_config
     cap = None
-    budget = 1.0 / FPS
+    measured_n, measured_at = 0, time.monotonic()
     while True:
         try:
             if cap is None:
-                cap = cv2.VideoCapture(DEVICE)
+                cap = cv2.VideoCapture(DEVICE, cv2.CAP_V4L2)
                 if not cap.isOpened():
                     raise RuntimeError("open failed")
+                # Configure before the first read starts streaming. Drain at the
+                # device cadence: sleeping after read() leaves old frames queued.
                 cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-                print(f"[fire_detect] camera opened: {DEVICE}", flush=True)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
+                cap.set(cv2.CAP_PROP_FPS, FPS)
+                # Two buffers let USB fill one while OpenCV decodes the other.
+                # One buffer can halve delivered FPS by missing alternate frames.
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+                fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+                _capture_config = dict(width=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                    height=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                    format=''.join(chr((fourcc >> (8*i)) & 255) for i in range(4)),
+                    fps=cap.get(cv2.CAP_PROP_FPS), buffers=cap.get(cv2.CAP_PROP_BUFFERSIZE))
+                print(f"[fire_detect] camera opened: {DEVICE} {_capture_config}", flush=True)
 
             ret, frame = cap.read()
             if not ret or frame is None:
                 raise RuntimeError("read failed (disconnected?)")
+            captured_at = time.time()
 
             h, w = frame.shape[:2]
             if w > STREAM_WIDTH:
@@ -111,14 +130,19 @@ def capture_loop():
                 )
             with _lock:
                 _latest_bgr = frame
-                _latest_bgr_t = time.time()
+                _latest_bgr_t = captured_at
                 _cap_count += 1
             _capture_ok = True
-            time.sleep(budget)
+            measured_n += 1
+            elapsed = time.monotonic()-measured_at
+            if elapsed >= 1.0:
+                _capture_fps = round(measured_n/elapsed, 1)
+                measured_n, measured_at = 0, time.monotonic()
 
         except Exception as e:
             print(f"[fire_detect] capture error: {e} — retry in 2s", flush=True)
             _capture_ok = False
+            _capture_fps = 0.0
             if cap is not None:
                 try:
                     cap.release()
@@ -283,6 +307,8 @@ _last_served = -1
 _last_jpeg = None
 _last_served_raw = -1
 _last_raw_jpeg = None
+_last_raw_snapshot = None
+_raw_encode_lock = threading.Lock()
 
 
 def _annotated_jpeg():
@@ -305,19 +331,28 @@ def _annotated_jpeg():
 
 def _raw_jpeg():
     """返回最新原始帧 JPEG(未标注,供相机面板);无帧返回 None。"""
-    global _last_served_raw, _last_raw_jpeg
-    with _lock:
-        bgr = _latest_bgr
-        count = _cap_count
-        if bgr is None:
+    snapshot = _raw_snapshot()
+    return snapshot[0] if snapshot else None
+
+
+def _raw_snapshot():
+    """Encode once per capture; keep JPEG, sequence and readout time paired."""
+    global _last_served_raw, _last_raw_jpeg, _last_raw_snapshot
+    with _raw_encode_lock:
+        with _lock:
+            bgr, count, captured_at, capture_ok = _latest_bgr, _cap_count, _latest_bgr_t, _capture_ok
+        if not capture_ok or bgr is None or time.time()-captured_at > 2.0:
             return None
-    if count != _last_served_raw or _last_raw_jpeg is None:
+        if count == _last_served_raw and _last_raw_snapshot is not None:
+            return _last_raw_snapshot
         ok, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, QUALITY])
         if not ok:
             return None
         _last_raw_jpeg = buf.tobytes()
         _last_served_raw = count
-    return _last_raw_jpeg
+        h, w = bgr.shape[:2]
+        _last_raw_snapshot = (_last_raw_jpeg, count, captured_at, w, h)
+        return _last_raw_snapshot
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -338,7 +373,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/frame.jpg":
             self._jpeg(_annotated_jpeg())
         elif path == "/raw.jpg":
-            self._jpeg(_raw_jpeg())
+            snapshot = _raw_snapshot()
+            self._jpeg(snapshot[0] if snapshot else None, snapshot)
         elif path == "/stream.mjpg":
             self._mjpeg()
         else:
@@ -350,6 +386,10 @@ class Handler(BaseHTTPRequestHandler):
         return {
             "device": DEVICE,
             "capture_ok": _capture_ok,
+            "capture_fps": _capture_fps,
+            "capture_config": dict(_capture_config),
+            "frame_age_ms": round((time.time()-_latest_bgr_t)*1000, 1) if _latest_bgr_t else None,
+            "frame_sequence": _cap_count,
             "fire": v["fire"],
             "confidence": v["confidence"],
             "reason": v["reason"],
@@ -368,7 +408,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _jpeg(self, data):
+    def _jpeg(self, data, snapshot=None):
         if data is None:
             self.send_error(503, "no frame yet")
             return
@@ -376,10 +416,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "image/jpeg")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
-        with _lock:
-            bgr = _latest_bgr
-        if bgr is not None:
-            h, w = bgr.shape[:2]
+        if snapshot:
+            _, count, captured_at, w, h = snapshot
+            self.send_header("X-Frame-Seq", str(count))
+            self.send_header("X-Frame-Captured-At", str(captured_at))
+        else:
+            with _lock:
+                bgr = _latest_bgr
+            h, w = bgr.shape[:2] if bgr is not None else (0, 0)
+        if w and h:
             self.send_header("X-Frame-W", str(w))
             self.send_header("X-Frame-H", str(h))
         self.end_headers()

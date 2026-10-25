@@ -15,7 +15,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 from map_store import checked_name, yaw
-from navigation_core import validate_calibration, fresh
+from navigation_core import validate_calibration, fresh, footprint_points
 from frontier_explorer import select_frontiers
 from inspection_service import atomic_json, timestamp, classify
 
@@ -141,7 +141,7 @@ class AutonomyRuntime:
         if self.compute_pending:raise ValueError('正在计算探索目标，请稍候')
         if not self.nav.last_pose:raise ValueError('尚未取得有效机器人位置')
         grid,stamp=self.grid();pose=dict(self.nav.last_pose);epoch=self.epoch
-        cfg=self.nav.config;clearance=math.hypot(cfg['length_m'],cfg['width_m'])/2+.10
+        clearance=max(math.hypot(x,y) for x,y in footprint_points(self.nav.config))+.10
         self.compute_pending=True
         def worker():
             try:result=select_frontiers(grid,pose,clearance,self.visited)

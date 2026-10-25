@@ -4,8 +4,8 @@
  * 2026-10-19: the old version polled GPIOHANDLE_GET_LINE_VALUES in a tight loop
  * (94% of one core, forever, even when the wheels were still). This one blocks
  * in poll() on four GPIO_GET_LINEEVENT fds and only wakes on an edge, so idle
- * CPU is ~0. It is also *more* accurate: every edge is reported, whereas the
- * polling version could miss a whole transition on fast rotation.
+ * CPU is ~0. Kernel queues can still lose edges under load; this implementation
+ * does not claim that every physical transition is captured.
  *
  * Contract (unchanged): one JSON line every 20 ms on stdout with
  *   elapsed, monotonic, counts[2], invalid[2], changes[4], samples,
@@ -44,6 +44,55 @@ static double now(void) {
 static const unsigned int OFFS[4] = {0, 12, 5, 1};
 static const int QUAD[16] = {0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0};
 
+/* Merge the heads of the four kernel queues by acquisition timestamp. Draining
+ * A completely before B destroys quadrature chronology when both have backlog. */
+static int earliest(const struct gpioevent_data head[4], const int ready[4]) {
+    int best = -1;
+    for (int i = 0; i < 4; i++)
+        if (ready[i] && (best < 0 || head[i].timestamp < head[best].timestamp))
+            best = i;
+    return best;
+}
+
+static void decode(int line, unsigned int id, int prev[2], long counts[2],
+                   long invalid[2], long forward[2], long reverse[2]) {
+    int pair = line / 2, mask = line % 2 == 0 ? 2 : 1;
+    int st = prev[pair];
+    int nx = id == GPIOEVENT_EVENT_RISING_EDGE ? st | mask : st & ~mask;
+    if (nx == st) { invalid[pair]++; return; }
+    int d = QUAD[(st << 2) | nx];
+    counts[pair] += d;
+    forward[pair] += d > 0;
+    reverse[pair] += d < 0;
+    prev[pair] = nx;
+}
+
+static int self_test(void) {
+    /* Four queued cycles, both wheels. Each line has its own FIFO, exactly as
+     * the GPIO v1 interface does. Old per-line draining gives wrong counts. */
+    struct gpioevent_data queues[4][8], head[4];
+    int cursor[4] = {0}, ready[4] = {1,1,1,1}, prev[2] = {0};
+    long counts[2] = {0}, invalid[2] = {0}, forward[2] = {0}, reverse[2] = {0};
+    for (int line = 0; line < 4; line++) {
+        for (int n = 0; n < 8; n++) {
+            queues[line][n].timestamp = (uint64_t)(n * 4 + line % 2 + 1);
+            queues[line][n].id = n % 2 == 0 ? GPIOEVENT_EVENT_RISING_EDGE : GPIOEVENT_EVENT_FALLING_EDGE;
+        }
+        head[line] = queues[line][0];
+    }
+    int i;
+    while ((i = earliest(head, ready)) >= 0) {
+        decode(i, head[i].id, prev, counts, invalid, forward, reverse);
+        ready[i] = ++cursor[i] < 8;
+        if (ready[i]) head[i] = queues[i][cursor[i]];
+    }
+    if (counts[0] != 16 || counts[1] != 16 || invalid[0] || invalid[1]) return 1;
+    decode(0, GPIOEVENT_EVENT_FALLING_EDGE, prev, counts, invalid, forward, reverse);
+    if (invalid[0] != 1) return 1; /* Real repeated edges must remain faults. */
+    puts("chronological backlog + two wheels + repeated-edge detection: PASS");
+    return 0;
+}
+
 static int read_level(int fd) {
     struct gpiohandle_data d;
     memset(&d, 0, sizeof d);
@@ -53,6 +102,7 @@ static int read_level(int fd) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--self-test") == 0) return self_test();
     char *end;
     if (argc < 2 || argc > 3)
         return 2;
@@ -96,7 +146,10 @@ int main(int argc, char **argv) {
          * 加上 signal() 默认 SA_RESTART,SIGTERM 也打断不了 => 进程永不退出
          * (2026-10-19 实测:duration=3 跑了 3 分钟还不走)。 */
         int fl = fcntl(fds[i], F_GETFL, 0);
-        if (fl >= 0) fcntl(fds[i], F_SETFL, fl | O_NONBLOCK);
+        if (fl < 0 || fcntl(fds[i], F_SETFL, fl | O_NONBLOCK) < 0) {
+            perror("nonblocking event fd");
+            return 1;
+        }
         pfd[i].fd = req.fd;
         pfd[i].events = POLLIN;
     }
@@ -127,6 +180,8 @@ int main(int argc, char **argv) {
     double maxgap = 0, windowgap = 0;
     long samples = 0, gaps = 0;
 
+    struct gpioevent_data head[4];
+    int ready[4] = {0};
     while (!stopped && (duration == 0 || now() - start < duration)) {
         int r = poll(pfd, 4, 20);
         double t = now();
@@ -137,49 +192,34 @@ int main(int argc, char **argv) {
         if (gap > .001) gaps++;
         samples++;
 
-        if (r > 0) {
-            for (int i = 0; i < 4; i++) {
-                if (!(pfd[i].revents & POLLIN))
-                    continue;
-                struct gpioevent_data ev;
-                while (read(fds[i], &ev, sizeof ev) == (ssize_t)sizeof ev) {
-                    events++;
-                    changes[i]++;
-                    int lvl = (ev.id == GPIOEVENT_EVENT_RISING_EDGE) ? 1 : 0;
-                    int pair = i / 2;
-                    int mask = (i % 2 == 0) ? 2 : 1;   /* first line of pair = A(bit1) */
-                    int st = prev[pair];
-                    int nx = lvl ? (st | mask) : (st & ~mask);
-                    if (nx == st) {
-                        invalid[pair]++;              /* repeated edge: phase lost */
-                        continue;
-                    }
-                    int d = QUAD[(st << 2) | nx];
-                    counts[pair] += d;
-                    forward[pair] += d > 0;
-                    reverse[pair] += d < 0;
-                    prev[pair] = nx;
-                }
+        if (r < 0 && errno != EINTR) { perror("poll"); return 1; }
+        for (int i = 0; i < 4; i++)
+            if (pfd[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                fprintf(stderr, "encoder event fd failed line %d\n", i);
+                return 1;
             }
+        /* One lookahead per line, refill only the earliest head. Never decode
+         * separate per-line batches. Bound work so reporting cannot starve. */
+        for (int n = 0; n < 4096 && !stopped; n++) {
+            for (int i = 0; i < 4; i++) {
+                if (ready[i]) continue;
+                ssize_t got = read(fds[i], &head[i], sizeof head[i]);
+                if (got == (ssize_t)sizeof head[i]) ready[i] = 1;
+                else if (got < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+                else { fprintf(stderr, "encoder event read failed line %d\n", i); return 1; }
+            }
+            int i = earliest(head, ready);
+            if (i < 0) break;
+            events++;
+            changes[i]++;
+            decode(i, head[i].id, prev, counts, invalid, forward, reverse);
+            ready[i] = 0;
         }
-
-        /* Every report tick, re-read the real levels. Any disagreement means we
-         * lost events (queue overflow) — count it, resync, never fabricate. */
+        /* A live-level read races queued edges and is not a coherent snapshot.
+         * Do not synthesize counts or resync state from those reads. Repeated
+         * edges still flag phase loss; v1 cannot prove absence of full-cycle loss. */
+        t = now();
         if (t - printed >= 0.02 || stopped) {
-            for (int i = 0; i < 4; i++) {
-                int lv = read_level(fds[i]);
-                if (lv < 0) continue;
-                level[i] = lv;
-            }
-            for (int p = 0; p < 2; p++) {
-                int real = level[p * 2] * 2 + level[p * 2 + 1];
-                if (real != prev[p]) {
-                    invalid[p]++;
-                    int d = QUAD[(prev[p] << 2) | real];
-                    counts[p] += d;
-                    prev[p] = real;
-                }
-            }
             printf("{\"elapsed\":%.6f,\"monotonic\":%.9f,\"counts\":[%ld,%ld],"
                    "\"invalid\":[%ld,%ld],\"changes\":[%ld,%ld,%ld,%ld],"
                    "\"samples\":%ld,\"max_gap_ms\":%.3f,\"window_gap_ms\":%.3f,"

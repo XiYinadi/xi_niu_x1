@@ -33,6 +33,12 @@ def validate_config(p, diagnostic=False):
     if p['sign_left'] not in (-1, 1) or p['sign_right'] not in (-1, 1):
         raise ValueError('encoder signs must be -1 or +1')
     cpu = p.get('sampler_cpu')
+    if p.get('sampler_backend', 'events') not in ('events', 'polling'):
+        raise ValueError('sampler_backend must be events or polling')
+    if type(p.get('sampler_realtime', False)) is not bool:
+        raise ValueError('sampler_realtime must be a boolean')
+    if p.get('sampler_realtime') and (p.get('sampler_backend') != 'polling' or cpu is None):
+        raise ValueError('realtime sampling requires polling and an explicit sampler_cpu')
     if cpu is not None and (type(cpu) is not int or cpu < 0):
         raise ValueError('sampler_cpu must be a nonnegative integer or null')
     if not diagnostic:
@@ -47,7 +53,7 @@ def validate_config(p, diagnostic=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--params', default=str(Path(__file__).with_suffix('.yaml')))
-    parser.add_argument('--sampler', default=str(Path(__file__).with_name('encoder_sampler')))
+    parser.add_argument('--sampler', help='Override the configured native sampler executable')
     parser.add_argument('--diagnostic', action='store_true')
     parser.add_argument('--check', action='store_true', help='Validate configuration without opening GPIO')
     parser.add_argument('--record-dir', default=str(Path.home() / 'slam_accuracy' / 'wheel_records'))
@@ -80,9 +86,12 @@ def main():
     counts_pub = node.create_publisher(String, '/encoder_counts', 10)
     pub = node.create_publisher(Odometry, '/odom', 10) if not args.diagnostic else None
     tf = TransformBroadcaster(node) if not args.diagnostic else None
-    sampler_command = [args.sampler, '0']
+    sampler_name = 'encoder_sampler_poll' if p.get('sampler_backend') == 'polling' else 'encoder_sampler'
+    sampler_command = [args.sampler or str(Path(__file__).with_name(sampler_name)), '0']
     if p.get('sampler_cpu') is not None:
         sampler_command.append(str(p['sampler_cpu']))
+    if p.get('sampler_realtime'):
+        sampler_command.append('rt')
     child = subprocess.Popen(sampler_command, stdout=subprocess.PIPE, text=True, bufsize=1)
     pending = queue.Queue(maxsize=100)
     overflow = threading.Event()
@@ -103,9 +112,16 @@ def main():
     last_log = 0.
     fault = None
     fault_reported = False
+    latched = False
+    last_phase_log = 0.
+    last_speed_log = 0.
     try:
         while rclpy.ok():
             rclpy.spin_once(node, timeout_sec=0)
+            # 2026-10-19: 每条样本独立判定。原实现 fault 只初始化一次、且任何一次
+            # 超限都会 continue 后永久保留 ⇒ 开车时一次相位丢失/瞬时超速就把
+            # /odom 锁死到重启为止（现场「一拉摇杆建图就挂」）。
+            fault = None
             try:
                 received, data = pending.get(timeout=.02)
             except queue.Empty:
@@ -116,8 +132,20 @@ def main():
             recorder.info(json.dumps(data))
             if overflow.is_set():
                 fault = '编码器采样队列溢出或数据格式错误'
-            if prev is not None:
-                fault = fault or sample_fault(prev, data)
+            # 相位丢失（采样跟不上 → 漏步）默认**只告警**：漏步的后果是少计
+            # （尺度偏小），比「没有 /odom、slam 丢帧、地图停住」轻得多。
+            # phase_fault_fatal: true 可退回旧的「锁死」行为（做标定时要严格）。
+            phase_loss = sample_fault(prev, data) if prev is not None else None
+            if phase_loss and p.get('phase_fault_fatal', False):
+                latched = True
+            elif phase_loss:
+                now_m = time.monotonic()
+                if now_m - last_phase_log > 10:
+                    node.get_logger().warning(
+                        '里程计相位丢失（采样漏步，只会少计）: %s' % phase_loss)
+                    recorder.warning(json.dumps({'event': 'phase_warning',
+                        'wall_time': time.time(), 'error': phase_loss}))
+                    last_phase_log = now_m
             if time.monotonic()-last_log > 2:
                 node.get_logger().info(f'counts={data["counts"]} invalid={data["invalid"]} '
                                        f'gap_ms={data.get("window_gap_ms")} cpu={data.get("cpu")} '
@@ -127,9 +155,9 @@ def main():
                 counts_pub.publish(String(data=json.dumps(data)))
                 prev = data
                 continue
-            if fault:
+            if latched or fault:
                 if not fault_reported:
-                    detail = f'{fault}: previous={prev} current={data}'
+                    detail = f'{fault or "phase loss (fatal)"}: previous={prev} current={data}'
                     node.get_logger().error('里程计已锁定停止发布，原始采集继续；修复后重新建图。' + detail)
                     recorder.error(json.dumps({'event': 'fault_latched', 'wall_time': time.time(), 'error': detail}))
                     fault_reported = True
@@ -146,9 +174,14 @@ def main():
             dl = (data['counts'][0]-prev['counts'][0])*p['sign_left']/p['counts_per_meter_left']
             dr = (data['counts'][1]-prev['counts'][1])*p['sign_right']/p['counts_per_meter_right']
             if max(abs(dl), abs(dr))/dt > p['max_wheel_speed_mps']:
+                # 瞬时超限只丢这一帧（fault 在下一轮开头会被清掉），不再永久锁死。
                 fault = (f'encoder displacement exceeds calibrated speed bound: '
                                    f'dt={dt:.6f}s dl={dl:.6f}m dr={dr:.6f}m '
                                    f'previous={prev} current={data}')
+                now_m = time.monotonic()
+                if now_m - last_speed_log > 5:
+                    node.get_logger().warning('里程计位移超速限，丢弃这一帧: ' + fault)
+                    last_speed_log = now_m
                 continue
             pose = integrate(pose, dl, dr, p['wheel_track_m'])
             prev = data

@@ -62,6 +62,7 @@ motor_driver:
     # motor_driver 不声明也不读这几个键(ROS 只取它声明过的),只给 pwm_proc。
     # 放在同一份文件里,是为了让「一条摇杆链路的所有参数」集中在一处。
     pwm_udp_port: 5813          # 摇杆 UDP 监听口(5811/5812 已被 cam_stream/fire_detect 占)
+    pwm_deadband: 0.0
     pwm_cmd_hz: 200.0           # duty 更新率;软 PWM 周期才 1ms,200Hz 已足够跟手
     # 超过这么久没收到摇杆包 → duty 0(本进程的本地急停)。
     # ⚠️ **跳闸 300ms,恢复要连续 600ms(= 2×300)** —— 有滞回,见

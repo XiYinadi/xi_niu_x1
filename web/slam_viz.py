@@ -5,7 +5,7 @@ slam_viz.py — 犀牛派 SLAM 实时 Web 可视化
 单文件方案: ROS2 订阅 + Flask-SocketIO WebSocket 推送 + 平铺多窗口前端
 窗口: 地图 / 相机 / 运行日志 (三窗口平铺网格)
 
-相机画面: cam_stream.py 独立进程捕获 USB 相机 → JPEG → slam_viz 转发 SocketIO
+相机画面: fire_detect.py 独占 USB 相机 → JPEG → slam_viz 按订阅转发 SocketIO
 运行日志: tail 各管线进程日志文件 → SocketIO 推送
 
 依赖 (全部已安装在犀牛派):
@@ -46,16 +46,18 @@ import numpy as np
 from PIL import Image
 
 # ── Flask + SocketIO ──────────────────────────────────────────────
-from flask import Flask, render_template_string, request, send_file
-from flask_socketio import SocketIO
+from flask import Flask, redirect, render_template_string, request, send_file
+from flask_socketio import SocketIO, join_room, leave_room
 
 # ── ROS2 ───────────────────────────────────────────────────────────
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from nav_msgs.msg import OccupancyGrid
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, Imu
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Bool
 
@@ -123,7 +125,7 @@ log.info("云台串口通道 → udp://%s:%d (需另起 gimbal_proc.py: bash ~/s
 CAMERA_STREAM_URL = os.environ.get(
     "SLAM_VIZ_CAM_URL", "http://127.0.0.1:5812/raw.jpg"
 )
-CAMERA_FPS = int(os.environ.get("SLAM_VIZ_CAM_FPS", 10))  # 目标帧率
+CAMERA_FPS = max(1, min(60, int(os.environ.get("SLAM_VIZ_CAM_FPS", 30))))
 
 # ── Fire detection config (env-overridable) ─────────────────────────
 # 火情标注帧/状态来自独立进程 fire_detect.py(ROS env 会破坏 cv2 的 V4L2,故分离)
@@ -243,6 +245,10 @@ class SlamVizNode(Node):
         self._last_scan_t = 0.0
         self._last_map_t = 0.0
         self._last_odom_t = 0.0
+        self._odometry = None
+        self._last_imu_t = 0.0
+        self._imu_acceleration = None
+        self._imu_frame = None
 
         # QoS: /map needs transient_local to receive last map immediately
         map_qos = QoSProfile(
@@ -250,19 +256,30 @@ class SlamVizNode(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
+        # Control/health consumers need the newest sample, never a queued history
+        # replayed after a slow callback or a scheduling pause.
         scan_qos = QoSProfile(
-            depth=10,
+            depth=1,
             reliability=ReliabilityPolicy.BEST_EFFORT,
         )
+        # Sensor receipt must continue while a navigation/service callback runs.
+        # A separate group plus two executor workers provides that isolation.
+        self._sensor_callbacks = MutuallyExclusiveCallbackGroup()
 
         self._map_sub = self.create_subscription(
             OccupancyGrid, "/map", self._map_cb, map_qos,
         )
         self._scan_sub = self.create_subscription(
             LaserScan, "/scan", self._scan_cb, scan_qos,
+            callback_group=self._sensor_callbacks,
         )
         self._odom_sub = self.create_subscription(
-            Odometry, "/odom", self._odom_cb, 10,
+            Odometry, "/odom", self._odom_cb, scan_qos,
+            callback_group=self._sensor_callbacks,
+        )
+        self._imu_sub = self.create_subscription(
+            Imu, "/imu/data_raw", self._imu_cb, scan_qos,
+            callback_group=self._sensor_callbacks,
         )
 
         # Motor control publishers (Web → /cmd_vel + /motor_arm)
@@ -274,6 +291,11 @@ class SlamVizNode(Node):
         )
         self._arm_pub = self.create_publisher(Bool, "/motor_arm", arm_qos)
         self._twist_lock = threading.Lock()
+        self._pending_twist = None
+        self._pending_arm = None
+        # HTTP/socket handlers must never wait inside a reliable DDS publish.
+        # Mirror only the latest command on the ROS executor; direct PWM is immediate.
+        self._drive_mirror_timer = self.create_timer(.02, self._flush_drive_mirror)
 
         # Trajectory: list of [x, y] tuples in odom frame
         self._trajectory = []  # up to TRAJ_MAX points
@@ -292,13 +314,29 @@ class SlamVizNode(Node):
         t.linear.x = max(-1.0, min(1.0, float(linear))) * MAX_LIN
         t.angular.z = max(-1.0, min(1.0, float(angular))) * MAX_ANG
         with self._twist_lock:
-            self._twist_pub.publish(t)
+            self._pending_twist = (t, time.monotonic())
 
     def set_motor_arm(self, on):
         b = Bool()
         b.data = bool(on)
         with self._twist_lock:
-            self._arm_pub.publish(b)
+            self._pending_arm = (b, time.monotonic())
+
+    def _flush_drive_mirror(self):
+        with self._twist_lock:
+            twist, arm = self._pending_twist, self._pending_arm
+            self._pending_twist = self._pending_arm = None
+        now = time.monotonic()
+        if twist is not None:
+            msg, received = twist
+            if now-received > .2:
+                msg = Twist()  # Never replay an old ROS motion after executor starvation.
+            self._twist_pub.publish(msg)
+        if arm is not None:
+            msg, received = arm
+            if msg.data and now-received > .2:
+                msg = Bool()
+            self._arm_pub.publish(msg)
 
     def _map_cb(self, msg: OccupancyGrid):
         with self._lock:
@@ -316,16 +354,45 @@ class SlamVizNode(Node):
             self._scan_count += 1
             self._last_scan_t = time.monotonic()
 
+    def _imu_cb(self, msg: Imu):
+        values = [float(msg.linear_acceleration.x), float(msg.linear_acceleration.y),
+                  float(msg.linear_acceleration.z)]
+        if msg.linear_acceleration_covariance[0] == -1 or not all(math.isfinite(v) for v in values):
+            return
+        with self._lock:
+            self._last_imu_t = time.monotonic()
+            self._imu_acceleration = values
+            self._imu_frame = msg.header.frame_id
+
     def _odom_cb(self, msg: Odometry):
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
         q = msg.pose.pose.orientation
+        vx = msg.twist.twist.linear.x
+        vy = msg.twist.twist.linear.y
+        wz = msg.twist.twist.angular.z
+        if not all(math.isfinite(v) for v in (x, y, q.x, q.y, q.z, q.w, vx, vy, wz)):
+            return
+        if abs(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w - 1.0) > .01:
+            return
         # yaw from quaternion (ZYX convention)
         yaw = math.atan2(
             2.0 * (q.w * q.z + q.x * q.y),
             1.0 - 2.0 * (q.y * q.y + q.z * q.z),
         )
         with self._lock:
+            now = time.monotonic()
+            stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            frame = (msg.header.frame_id, msg.child_frame_id)
+            previous = self._odometry
+            # A source interruption or clock/frame reset invalidates a browser's
+            # measurement origin. Map/SLAM corrections never change this raw pose.
+            restarted = (previous is None or now - self._last_odom_t >= 1.0
+                         or frame != (previous['frame'], previous['child_frame'])
+                         or stamp < previous['stamp'])
+            self._odometry = dict(x=x, y=y, yaw=yaw, vx=vx, vy=vy, wz=wz,
+                                  frame=frame[0], child_frame=frame[1], stamp=stamp,
+                                  generation=now if restarted else previous['generation'])
             # 存的时候就四舍五入到 3 位(1mm,远超地图精度):全精度浮点
             # 像 1.2345678901234567 每个 18 字节,是纯浪费 —— 单条轨迹本来
             # 能到 ~200KB,砍掉 2/3 是在这里而不是在发送端。
@@ -334,7 +401,7 @@ class SlamVizNode(Node):
             if len(self._trajectory) > TRAJ_MAX:
                 self._trajectory = self._trajectory[-TRAJ_MAX:]
             self._latest_pose = (x, y, yaw)
-            self._last_odom_t = time.monotonic()
+            self._last_odom_t = now
 
     def full_trajectory(self, map_frame=True) -> dict:
         """整条轨迹,只给新连上来的客户端补历史用。
@@ -423,6 +490,10 @@ class SlamVizNode(Node):
                 "scan_age": (now - self._last_scan_t) if self._last_scan_t else None,
                 "map_age": (now - self._last_map_t) if self._last_map_t else None,
                 "odom_age": (now - self._last_odom_t) if self._last_odom_t else None,
+                "odometry": self._odometry,
+                "imu_age": (now - self._last_imu_t) if self._last_imu_t else None,
+                "imu_acceleration": self._imu_acceleration,
+                "imu_frame": self._imu_frame,
             }
 
         # Encode map PNG outside lock (CPU-heavy, no shared state)
@@ -455,8 +526,68 @@ socketio = SocketIO(
 
 
 @app.route("/")
+@app.route("/mapping")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(HTML_TEMPLATE, page_class="mapping-page")
+
+
+@app.route("/console")
+def console():
+    return redirect('/mapping')
+
+
+@app.route("/control")
+def control():
+    return render_template_string(HTML_TEMPLATE, page_class="control-page")
+
+
+@app.route('/explore')
+@app.route('/patrol')
+@app.route('/navigation')
+def mission_page():
+    mode = {'/explore':'explore-page', '/patrol':'patrol-page', '/navigation':'navigation-page'}[request.path]
+    return render_template_string(HTML_TEMPLATE, page_class='mission-page '+mode)
+
+
+@app.route('/missions.css')
+@app.route('/missions.js')
+@app.route('/navigation_page.js')
+def mission_asset():
+    return send_file(os.path.join(os.path.dirname(os.path.realpath(__file__)), request.path.lstrip('/')))
+
+
+@app.get('/api/missions/readiness')
+def mission_readiness():
+    config = _navigation.config if _navigation is not None else {}
+    error = _navigation.calibration_error() if _navigation is not None else '任务组件尚未就绪'
+    keys = ('wheelbase_m','length_m','width_m','max_steering_rad','full_throttle_mps','max_speed_mps','trial_max_steering_rad','trial_pwm_cap')
+    measurements = {key:config.get(key) if type(config.get(key)) in (int, float)
+                    and math.isfinite(config[key]) else None for key in keys}
+    result = dict(calibrated=error is None, calibration_error=error,
+                  drive_error=_navigation.drive_error() if _navigation is not None else error,
+                  drive_mode='supervised_trial' if config.get('navigation_mode')=='supervised_trial' else 'calibrated',
+                  measurements=measurements)
+    return app.response_class(json.dumps(result, allow_nan=False), mimetype='application/json')
+
+
+@app.route('/control.css')
+@app.route('/control.js')
+def control_asset():
+    return send_file(os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                 request.path.lstrip('/')))
+
+
+@app.route('/mapping.css')
+@app.route('/mapping.js')
+def mapping_asset():
+    return send_file(os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                 request.path.lstrip('/')))
+
+
+@app.route('/vendor/socket.io.min.js')
+def socketio_client_asset():
+    return send_file(os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                                 'vendor', 'socket.io.min.js'), mimetype='text/javascript')
 
 
 @app.route('/navigation.js')
@@ -487,7 +618,8 @@ def navigation_control(data):
             _navigation.control(data, request.sid)
     except Exception as e:
         socketio.emit('navigation_error', {'message': str(e)}, to=request.sid)
-    _navigation.emit()
+    if data.get('action') != 'heartbeat':
+        _navigation.emit()
 
 
 def _navigation_disarm():
@@ -533,7 +665,8 @@ MAPPING_TIMEOUT_S = 45
 _map_lock = threading.Lock()
 _map_busy = False       # 一次只允许一个 start/stop 在路上
 _map_action = None      # 正在进行的是什么,给 UI 显示「启动中…」用
-_map_last = {"scan_age": None, "map_age": None, "odom_age": None}
+_map_last = {"scan_age": None, "map_age": None, "odom_age": None, "imu_age": None,
+             "imu_acceleration": None, "imu_frame": None, "odometry": None}
 
 
 def _map_state_payload():
@@ -545,6 +678,10 @@ def _map_state_payload():
         "scan_age": _map_last["scan_age"],
         "map_age": _map_last["map_age"],
         "odom_age": _map_last["odom_age"],
+        "odometry": _map_last.get("odometry"),
+        "imu_age": _map_last["imu_age"],
+        "imu_acceleration": _map_last.get("imu_acceleration"),
+        "imu_frame": _map_last.get("imu_frame"),
         "busy": _map_busy,
         "action": _map_action,
         "managed": managed,
@@ -624,22 +761,29 @@ def broadcast_loop():
     last_scan_seq = None
     last_pose_key = None
     last_map_status = None
+    last_health_emit = 0.0
     log.info("Broadcast loop started")
     while True:
         try:
             state = _ros_node.get_state_snapshot()
 
             # 建图状态:每轮都重算(状态会**在没人发包的时候**变陈旧,所以不能只在
-            # 收到数据时算),变了才发 —— 边沿触发,和下面 pose 一个路子。
+            # 收到数据时算)。状态变更立即推送，数据年龄最多每 250ms 更新一次。
             feed = state.get("feed")
             if feed:
                 _map_last["scan_age"] = feed["scan_age"]
                 _map_last["map_age"] = feed["map_age"]
                 _map_last["odom_age"] = feed["odom_age"]
+                _map_last["odometry"] = feed.get("odometry")
+                _map_last["imu_age"] = feed["imu_age"]
+                _map_last["imu_acceleration"] = feed.get("imu_acceleration")
+                _map_last["imu_frame"] = feed.get("imu_frame")
             p = _map_state_payload()
             key = (p["status"], p["busy"], p["action"],p['managed'])
-            if key != last_map_status:
+            if key != last_map_status or time.monotonic() - last_health_emit >= 0.25:
                 socketio.emit("mapping_state", p)
+                last_health_emit = time.monotonic()
+            if key != last_map_status:
                 last_map_status = key
                 log.info("建图状态 → %s (scan_age=%s map_age=%s busy=%s)",
                          p["status"],
@@ -653,7 +797,7 @@ def broadcast_loop():
                 # (map_dirty flag means we just got a new one)
                 now = time.time()
                 if now - last_map_emit > 0.5:
-                    socketio.emit("map", state["map"])
+                    socketio.emit("map", state["map"], to='map_view')
                     last_map_emit = now
                     log.debug(
                         "map emitted: %dx%d @ %.2fm",
@@ -666,19 +810,19 @@ def broadcast_loop():
             # 之前用 hash(len(points)) 判变 —— 点数不变时整个激光叠加层冻结,是 bug。
             if "scan" in state:
                 if state["scan"]["seq"] != last_scan_seq:
-                    socketio.emit("scan", state["scan"])
+                    socketio.emit("scan", state["scan"], to='map_view')
                     last_scan_seq = state["scan"]["seq"]
 
             # 轨迹:state 里只在**真的有新点**时才带这个 key,所以这里是真·增量
             if "trajectory" in state:
-                socketio.emit("trajectory", state["trajectory"])
+                socketio.emit("trajectory", state["trajectory"], to='map_view')
 
             # Emit pose when changed
             if "pose" in state:
                 p = state["pose"]
                 key = (p["x"], p["y"], p["yaw"])
                 if key != last_pose_key:
-                    socketio.emit("pose", p)
+                    socketio.emit("pose", p, to='map_view')
                     last_pose_key = key
         except Exception:
             log.exception("broadcast error")
@@ -693,7 +837,9 @@ def broadcast_loop():
 _cam_enabled = threading.Event()  # set while ≥1 client wants the stream
 _cam_lock = threading.Lock()
 _cam_clients = set()  # sids that requested the stream
+_cam_flow = {}  # opt-in clients: None=ready, token=one frame awaiting decode ACK
 _cam_status = {"running": False, "w": 0, "h": 0, "fps": 0.0, "error": None}
+CAMERA_ROOM = "camera_preview"
 
 
 def _cam_publish_state():
@@ -702,34 +848,63 @@ def _cam_publish_state():
     socketio.emit("camera_state", state)
 
 
+def _cam_publish_frame(image, width, height, sequence=None, captured_at=None):
+    payload = {"img": image, "w": width, "h": height,
+               "sequence": sequence, "captured_at": captured_at}
+    # Old clients retain the room contract. Updated pages allow at most one
+    # in-flight frame each; slow decoding/network skips frames rather than queues.
+    socketio.emit("frame", payload, to=CAMERA_ROOM)
+    ready = []
+    with _cam_lock:
+        for sid, pending in _cam_flow.items():
+            if pending is None:
+                token = object()
+                _cam_flow[sid] = token
+                ready.append((sid, token))
+    for sid, token in ready:
+        def decoded(*args, sid=sid, token=token):
+            with _cam_lock:
+                if _cam_flow.get(sid) is token:
+                    _cam_flow[sid] = None
+        socketio.emit("frame", payload, to=sid, callback=decoded)
+
+
 def camera_loop():
-    """Daemon thread: pull JPEG from cam_stream.py → base64 → emit 'frame'."""
+    """Pull existing fire_detect JPEGs; never opens the camera device itself."""
     log.info("Camera stream thread started (url=%s)", CAMERA_STREAM_URL)
     frame_budget = 1.0 / CAMERA_FPS
     fps_n, fps_t0 = 0, time.time()
+    last_sequence = None
 
     while True:
         try:
             if not _cam_enabled.is_set():
-                # Idle: just poll the event (cam_stream handles the device)
+                # Idle: fire_detect remains the sole camera-device owner.
                 if _cam_status.get("running"):
                     _cam_status.update(running=False)
                     _cam_publish_state()
                 time.sleep(0.2)
                 continue
 
+            started = time.monotonic()
             # Pull the latest frame from the standalone camera process
             with urllib.request.urlopen(CAMERA_STREAM_URL, timeout=2.0) as resp:
                 jpg = resp.read()
                 w = int(resp.headers.get("X-Frame-W", 0))
                 h = int(resp.headers.get("X-Frame-H", 0))
+                sequence = resp.headers.get("X-Frame-Seq")
+                captured_at = float(resp.headers.get("X-Frame-Captured-At", 0)) or None
 
             if not jpg:
                 time.sleep(frame_budget)
                 continue
+            if sequence is not None and sequence == last_sequence:
+                time.sleep(max(0, frame_budget-(time.monotonic()-started)))
+                continue
+            last_sequence = sequence
 
             b64 = base64.b64encode(jpg).decode("ascii")
-            socketio.emit("frame", {"img": b64, "w": w, "h": h})
+            _cam_publish_frame(b64, w, h, sequence, captured_at)
 
             if not _cam_status.get("running"):
                 _cam_status.update(running=True, error=None)
@@ -743,7 +918,7 @@ def camera_loop():
                 _cam_publish_state()
 
             # Throttle toward target fps
-            time.sleep(max(0.0, frame_budget - (time.time() - now)))
+            time.sleep(max(0.0, frame_budget - (time.monotonic() - started)))
 
         except Exception as e:
             log.warning("camera error: %s — retrying in 1s", e)
@@ -874,6 +1049,13 @@ def _emit_motor_state():
     socketio.emit("motor_state", {"armed": _motor_armed, "driver": _drive_owner})
 
 
+_drive_io_lock = threading.RLock()
+
+# 2026-10-24: 手动驾驶延迟统计（每 5 秒一行，p50/p95/max）
+_lat_samples = []
+_lat_last_log = 0.0
+
+
 def _send_drive(l, a, armed):
     """把归一化摇杆值直发 pwm_proc(绕开 ROS)。
 
@@ -884,12 +1066,46 @@ def _send_drive(l, a, armed):
     字段决定动不动电机,上电默认 false(必须网页点「启用电机」)。
     """
     try:
-        _pwm_sock.sendto(
-            json.dumps({"l": float(l), "a": float(a),
-                        "armed": bool(armed)}).encode(),
-            (PWM_UDP_HOST, PWM_UDP_PORT))
+        with _drive_io_lock:
+            _pwm_sock.sendto(
+                json.dumps({"l": float(l), "a": float(a),
+                            "armed": bool(armed and _motor_armed)}).encode(),
+                (PWM_UDP_HOST, PWM_UDP_PORT))
     except OSError as e:
         log.debug("pwm udp send failed: %s", e)
+
+
+def _stage1_drive_packet(data):
+    """Loopback latest-value input; never grants ownership or enables motors."""
+    with _drive_io_lock:
+        if not isinstance(data, dict) or not _motor_armed or data.get('sid') != _drive_owner:
+            return
+        try:
+            l,a=float(data['l']),float(data['a'])
+            valid=all(math.isfinite(x) and abs(x)<=1 for x in (l,a))
+        except (KeyError,ValueError,TypeError):
+            valid=False
+        if not valid or not drive_packet_fresh(data,time.monotonic()):
+            _navigation_disarm()
+            return
+        _send_drive(l,a,True)
+
+
+def stage1_drive_loop():
+    sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+    sock.bind(('127.0.0.1',5818))
+    sock.settimeout(.1)
+    while True:
+        try:
+            packet,_=sock.recvfrom(1024)
+            sock.setblocking(False)
+            try:
+                while True:packet,_=sock.recvfrom(1024)
+            except BlockingIOError:pass
+            finally:sock.settimeout(.1)
+            _stage1_drive_packet(json.loads(packet))
+        except (socket.timeout,ValueError,UnicodeError):pass
+        except Exception:log.exception('stage1 UDP input error')
 
 
 def _emit_gimbal_state():
@@ -946,26 +1162,32 @@ def _send_gimbal(dx, dy):
 @socketio.on("disconnect")
 def _on_disconnect():
     global _motor_armed, _drive_owner, _gimbal_owner
-    if _navigation is not None and request.sid == _navigation.nav_owner:
-        _navigation.cancel('操作者断线，导航已取消', disarm=True)
-    _cam_clients.discard(request.sid)
-    if not _cam_clients:
-        _cam_enabled.clear()
-        log.info("All clients left — camera stream OFF")
+    navigation_owned = _navigation is not None and request.sid == _navigation.nav_owner
+    # Disconnect must stop hardware before acquiring navigation locks/RPCs.
+    # An observer disconnect must leave the actual driver's task untouched.
+    if _motor_armed and request.sid == _drive_owner:
+        _motor_armed = False
+        _drive_owner = None
+        _send_drive(0.0, 0.0, False)
+        _ros_node.publish_cmd_vel(0.0, 0.0)
+        _ros_node.set_motor_arm(False)
+        _emit_motor_state()
+        log.warning("Driver disconnected — motors disarmed")
+    if navigation_owned:
+        try:
+            _navigation.cancel('操作者断线，导航已取消', disarm=True)
+        except Exception:
+            log.exception('Navigation cancellation failed after disconnect output was disarmed')
+    with _cam_lock:
+        _cam_clients.discard(request.sid)
+        _cam_flow.pop(request.sid, None)
+        if not _cam_clients:
+            _cam_enabled.clear()
+            log.info("All clients left — camera stream OFF")
     _fire_clients.discard(request.sid)
     if not _fire_clients:
         _fire_enabled.clear()
         log.info("All clients left — fire stream OFF")
-    # 驾驶者断开 → 急停(防止浏览器关页后机器人继续跑)。
-    # 非驾驶者的客户端断开不动电机 —— 否则另一台设备的页面一刷新就把车停了。
-    if _motor_armed and request.sid == _drive_owner:
-        _motor_armed = False
-        _drive_owner = None
-        _ros_node.publish_cmd_vel(0.0, 0.0)
-        _ros_node.set_motor_arm(False)
-        _send_drive(0.0, 0.0, False)      # 直连通道也要停,pwm_proc 不看 ROS
-        _emit_motor_state()
-        log.warning("Driver disconnected — motors disarmed")
     # 云台操作者断开 → 释放操作权,**并把云台停住(发零速)**。
     # ⚠️ 措辞是「停」不是「回中」:`0xAA` 是**速度帧**,`(0,0)` = 速度 0 = **停**。
     #    收端不会去找中位 —— 回中只有 `0xBB cmd=1/2` 能做,我们没实现。
@@ -984,18 +1206,45 @@ def _on_disconnect():
 
 @socketio.on("camera_control")
 def _on_camera_control(data):
+    if not isinstance(data, dict):
+        return
     action = (data or {}).get("action")
     if action == "start":
-        _cam_clients.add(request.sid)
-        _cam_enabled.set()
-        _cam_status.update(error=None)
+        flow = data.get('flow_control') is True
+        if flow:
+            leave_room(CAMERA_ROOM)
+        else:
+            join_room(CAMERA_ROOM)
+        with _cam_lock:
+            _cam_clients.add(request.sid)
+            if flow:
+                _cam_flow.setdefault(request.sid, None)
+            else:
+                _cam_flow.pop(request.sid, None)
+            _cam_enabled.set()
+            _cam_status.update(error=None)
         log.info("Camera stream ON (sid=%s)", request.sid)
     elif action == "stop":
-        _cam_clients.discard(request.sid)
-        if not _cam_clients:
-            _cam_enabled.clear()
-            log.info("Camera stream OFF (sid=%s)", request.sid)
+        leave_room(CAMERA_ROOM)
+        with _cam_lock:
+            _cam_clients.discard(request.sid)
+            _cam_flow.pop(request.sid, None)
+            if not _cam_clients:
+                _cam_enabled.clear()
+                log.info("Camera stream OFF (sid=%s)", request.sid)
     _cam_publish_state()
+
+
+@socketio.on("camera_sync")
+def _on_camera_sync():
+    # Clock alignment for estimated readout-to-browser age; never actuates hardware.
+    return time.time()
+
+
+@socketio.on("drive_sync")
+def _on_drive_sync():
+    # Driver timestamps share this process's monotonic clock, never wall time.
+    return time.monotonic()
 
 
 @socketio.on("fire_control")
@@ -1015,7 +1264,13 @@ def _on_fire_control(data):
 
 
 def drive_packet_fresh(data, now):
-    """Local gamepad timestamps prevent queued commands replaying after a stall."""
+    """Reject queued browser or local gamepad commands after a transport stall."""
+    if 'sent_at' in data:
+        try:
+            age = time.time()-float(data['sent_at'])
+            return math.isfinite(age) and -0.05 <= age <= 0.20
+        except (TypeError, ValueError):
+            return False
     if 'sent_monotonic' not in data:
         return True
     try:
@@ -1027,9 +1282,10 @@ def drive_packet_fresh(data, now):
 
 @socketio.on("motor_control")
 def _on_motor_control(data):
-    global _motor_armed, _drive_owner, _drive_owner_note_ts, _gimbal_owner
+    global _motor_armed, _drive_owner, _drive_owner_note_ts, _gimbal_owner, _lat_last_log
     action = (data or {}).get("action")
     if action == "vel":
+        _t0 = time.monotonic()
         # 只认「已经启用电机」的那个驾驶者的指令:另一台设备发来的(通常是持续 0)
         # 直接丢弃,否则会把真值切断成锯齿,电机来回抖。见 _drive_owner 的注释。
         #
@@ -1053,8 +1309,10 @@ def _on_motor_control(data):
             _motor_armed = False
             _drive_owner = None
             _send_drive(0.0, 0.0, False)
+            _ros_node.publish_cmd_vel(0.0, 0.0)
+            _ros_node.set_motor_arm(False)
             _emit_motor_state()
-            log.warning('Expired gamepad command: motors disarmed')
+            log.warning('Expired drive command: motors disarmed')
             return
         # 摇杆/键盘发来已归一化 -1..1 的速度
         lin = float(data.get("linear", 0.0))
@@ -1063,9 +1321,31 @@ def _on_motor_control(data):
             if abs(lin) < 0.001 and abs(ang) < 0.001 and not data.get('takeover'):
                 return  # Idle manual heartbeats must not overwrite autonomous commands.
             _navigation.cancel('手动接管，导航已取消')
-        _ros_node.publish_cmd_vel(lin, ang)
+        # A loopback ROS bridge has already consumed /cmd_vel. Mirroring its
+        # normalized output back to that topic would create a feedback loop.
+        ros_input = data.get('source') == 'ros_stage1' and request.remote_addr in ('127.0.0.1', '::1')
+        if not ros_input:
+            _ros_node.publish_cmd_vel(lin, ang)
         _send_drive(lin, ang, _motor_armed)   # 别硬编码 True;见上
+        try:
+            _age = (time.monotonic()-float(data['sent_monotonic']) if 'sent_monotonic' in data
+                    else time.time()-float(data['sent_at']))
+        except (KeyError, TypeError, ValueError):
+            _age = None
+        if _age is not None:
+            _lat_samples.append((_age*1000.0, (time.monotonic()-_t0)*1000.0))
+            if len(_lat_samples) >= 10 and time.monotonic()-_lat_last_log > 5.0:
+                _lat_last_log = time.monotonic()
+                _a = sorted(x[0] for x in _lat_samples)
+                _c = sorted(x[1] for x in _lat_samples)
+                log.info('drive latency n=%d age p50=%.0f p95=%.0f max=%.0f ms | handler p95=%.1f ms',
+                         len(_a), _a[len(_a)//2], _a[int(len(_a)*0.95)-1], _a[-1],
+                         _c[int(len(_c)*0.95)-1])
+                _lat_samples.clear()
     elif action == "arm":
+        if data.get('claim_if_disarmed') and _motor_armed and _drive_owner != request.sid:
+            _emit_motor_state()
+            return
         if _navigation is not None and (_navigation.navigating or _navigation.pending or _automatic_active()):
             _navigation.cancel('驾驶使能改变，导航已取消')
         # 谁按的「启用电机」谁就是驾驶者;解除时让出控制权
@@ -1078,13 +1358,12 @@ def _on_motor_control(data):
         log.info("Motor %s (driver=%s)",
                  "ARMED" if _motor_armed else "disarmed", _drive_owner or "-")
     elif action == "estop":
-        if _navigation is not None:
-            _navigation.cancel('急停，导航已取消')
         _motor_armed = False
         _drive_owner = None
+        # Hardware stop must precede any Nav2 lock/service cancellation.
+        _send_drive(0.0, 0.0, False)
         _ros_node.publish_cmd_vel(0.0, 0.0)
         _ros_node.set_motor_arm(False)
-        _send_drive(0.0, 0.0, False)
         # ⚠️ 顺手把云台也**停住**(发零速)。**不改这个的话**:一个叫「急停」的按钮
         #    按下去,相机云台还在动 —— 那是**模糊的**,而模糊的急停比没有急停更坏。
         #    这一行让按钮的标签变诚实。
@@ -1095,6 +1374,11 @@ def _on_motor_control(data):
         _send_gimbal(0, 0)
         _emit_gimbal_state()
         _emit_motor_state()
+        if _navigation is not None:
+            try:
+                _navigation.cancel('急停，导航已取消')
+            except Exception:
+                log.exception('Navigation cancellation failed after ESTOP output was disarmed')
         log.warning("ESTOP pressed — motors disarmed, gimbal stopped (zero velocity)")
 
 
@@ -1208,7 +1492,7 @@ def _push_log(tag: str, line: str):
     }
     with _log_lock:
         _log_buffer.append(entry)
-    socketio.emit("log", entry)
+    socketio.emit("log", entry, to='log_view')
 
 
 def log_tail_loop():
@@ -1257,10 +1541,15 @@ def _on_connect(auth=None):
     _up = str(request.environ.get("HTTP_UPGRADE", "")).lower()
     log.info("Client %s connected (transport=%s)",
              request.sid, "websocket" if _up == "websocket" else "polling")
+    view = request.args.get('view', 'console')
+    map_view = view not in ('control', 'camera')
+    if map_view:
+        join_room('map_view')
+        join_room('log_view')
     # Send a snapshot of recent logs to the newly connected client
     with _log_lock:
         snapshot = list(_log_buffer)
-    if snapshot:
+    if snapshot and map_view:
         socketio.emit("log_snapshot", snapshot, to=request.sid)
     # Push current motor armed state (default disarmed)
     socketio.emit("motor_state",
@@ -1278,7 +1567,15 @@ def _on_connect(auth=None):
     # 轨迹走的是**增量**,新客户端手里没有历史 —— 不补这一发,它就只会从
     # 「连上的那一刻」开始画,之前走过的路是空的(刷新页面、开第二个标签页
     # 尤其明显)。只发给这个 sid,不影响已经在线的客户端。
-    if _ros_node is not None:
+    if _ros_node is not None and map_view:
+        # Map servers publish once; a new browser must receive the cached
+        # static map even if no future /map callback marks it dirty again.
+        with _ros_node._lock:
+            map_msg = _ros_node._latest_map_msg
+        if map_msg is not None:
+            map_data = occgrid_to_png_base64(map_msg)
+            if map_data:
+                socketio.emit('map', map_data, to=request.sid)
         traj = _ros_node.full_trajectory()
         if traj:
             socketio.emit("trajectory", traj, to=request.sid)
@@ -1366,7 +1663,10 @@ def main():
         _navigation.autonomy.start_threads()
 
     # Spin rclpy in daemon thread
-    spin_thread = threading.Thread(target=rclpy.spin, args=(_ros_node,), daemon=True)
+    threading.Thread(target=stage1_drive_loop, daemon=True).start()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(_ros_node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
     log.info("rclpy spinning in daemon thread")
 
@@ -1410,8 +1710,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>犀牛一号 · 控制台</title>
-<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<title>犀牛一号 · 建图工作台</title>
+<script src="/vendor/socket.io.min.js"></script>
 <style>
   :root {
     --bg:#1c1c24; --bg-2:#16161d;
@@ -1755,12 +2055,20 @@ button:focus-visible,summary:focus-visible,a:focus-visible { outline:2px solid v
 #speed-gears { display:flex; align-items:center; gap:8px; }#speed-gears span { margin-right:auto; color:var(--dim); }
 #speed-gears button { background:#253b44; color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:8px 22px; cursor:pointer; }
 #speed-gears button.on { background:var(--accent); color:#10201c; }#gear-hint { color:var(--dim); font-size:12px; line-height:1.6; }
+  .mapping-only,.control-only,.mission-only { display:none; }
 </style>
+<link rel="stylesheet" href="/mapping.css?v=20261023-odom1">
+<link rel="stylesheet" href="/control.css?v=20261021-drive3">
+<link rel="stylesheet" href="/missions.css?v=20261023-navigation1">
 </head>
-<body>
+<body class="{{ page_class }}">
 
 <div id="status-bar">
   <strong class="brand">犀牛一号 <small>控制台</small></strong>
+  <div class="mapping-only mapping-brand"><span class="brand-mark" aria-hidden="true">R</span><strong>犀牛一号</strong><span class="brand-divider"></span><span>建图工作台</span></div>
+  <div class="control-only control-brand"><span class="brand-mark" aria-hidden="true">R</span><strong>犀牛一号</strong><span class="brand-divider"></span><span>遥控工作台</span></div>
+  <div class="mission-only mission-brand"><span class="brand-mark" aria-hidden="true">R</span><strong>犀牛一号</strong></div>
+  <nav class="page-links" aria-label="功能页面"><a href="/mapping">返回建图</a><a href="/control">遥控驾驶</a><details class="mission-menu"><summary>自动任务⌄</summary><div><a href="/navigation">定位与导航</a><a href="/explore">自动建图</a><a href="/patrol">路线巡检</a><a href="/inspection">检测与报告 ↗</a></div></details></nav>
   <span id="status-conn"><span id="conn-dot"></span><span id="conn-text">未连接</span></span>
   <span class="hide-narrow"><span class="stat-label">环境地图</span><span id="s-map">—</span></span>
   <span><span class="stat-label">雷达</span><span id="s-scan">—</span></span>
@@ -1774,7 +2082,33 @@ button:focus-visible,summary:focus-visible,a:focus-visible { outline:2px solid v
 <div id="autonomy-alert" hidden role="alert" style="position:fixed;top:48px;left:10%;right:10%;z-index:100;background:#642522;border:2px solid #f48772;border-radius:8px;padding:16px;color:#fff;white-space:normal"><span id="autonomy-alert-message"></span> <a id="autonomy-alert-evidence" hidden target="_blank" rel="noopener" style="text-decoration:underline">查看现场证据 ↗</a></div>
 
 <div id="workspace">
-<aside id="controls-panel" aria-label="机器人操作"><div class="control-intro"><span class="eyebrow">操作面板</span><h2>今天想让小犀做什么？</h2><p>手动驾驶，或按步骤建图、导航与巡检。</p></div>      <div id="drive" class="collapsed">
+<section class="mission-only mission-heading"><div><div class="page-eyebrow">SUPERVISED MISSIONS</div><h1 id="mission-title">自动任务</h1><p id="mission-description">准备、预览，再由现场操作者启动。</p></div><div class="mission-tabs"><a href="/explore">自动建图</a><a href="/patrol">路线巡检</a><a href="/inspection">检测与报告 ↗</a></div></section>
+<section class="control-only control-heading"><div><div class="page-eyebrow">REMOTE CONTROL</div><h1>遥控工作台</h1><p>驾驶与云台独立控制，松开摇杆即停止。</p></div><span id="ctl-owner" class="control-owner">等待连接</span></section>
+<section class="mapping-only mapping-heading"><div><div class="page-eyebrow">MAPPING WORKSPACE</div><h1>一步一步，画出环境。</h1><p>启动建图，缓慢驾驶，完成后保存地图。</p><div class="mobile-feed" id="mp-mobile-status">等待传感器数据</div></div><span class="mapping-session"><i></i><span id="mp-session">等待设备连接</span></span></section>
+<aside id="controls-panel" aria-label="机器人操作">
+<section class="mission-only mission-card" id="mission-health"><div class="card-heading"><h2>启动条件</h2><span id="mission-ready" class="status-pill">等待连接</span></div><ul id="mission-checks"></ul><details id="mission-calibration"><summary>实车标定缺项</summary><div id="mission-measurements">正在读取配置…</div><p>需要现场实测最大车轮转角，以及固定油门档位下的距离和耗时。请同时记录档位和地面条件；软件不会根据 PWM 比例推算实际车速。</p></details></section>
+<section class="mission-only mission-card" id="mission-setup"><span class="mission-step">01 / 准备</span><h2 id="mission-setup-title">准备任务</h2><p id="mission-setup-note"></p><div id="mission-setup-controls"></div></section>
+<section class="mission-only mission-card" id="mission-route"><span class="mission-step">02 / 预览</span><h2 id="mission-route-title">查看任务目标</h2><div id="mission-route-controls"></div><p id="mission-preview-note">配置和预览不会启用电机。</p></section>
+<section class="mission-only mission-card" id="mission-run"><span class="mission-step">03 / 执行</span><h2>现场监督执行</h2><p id="mission-run-note">标定和定位就绪后，由当前页面启用电机，再明确启动任务。</p><div id="mission-run-controls"></div><div class="mission-progress"><span id="mission-stage">等待任务</span><strong id="mission-progress">0</strong><small>已完成目标 / 点位</small></div><div id="mission-runtime"></div><div id="mission-runtime-controls"></div></section>
+<section class="mapping-only mapping-odometry" aria-label="实时里程计">
+<div class="card-heading"><h2>实时里程计</h2><span id="mp-odometry-state" class="status-pill">等待数据</span></div>
+<p class="odometry-source">雷达 + GY-521 · /odom</p>
+<div class="odometry-toolbar"><span>相对测量起点</span><button type="button" id="mp-odometry-zero" disabled>设为测量起点</button></div>
+<div class="odometry-grid">
+<div><span>前进 / 后退 cm</span><strong id="mp-odometry-forward">—</strong></div>
+<div><span>左 / 右偏移 cm</span><strong id="mp-odometry-lateral">—</strong></div>
+<div><span>转角 °</span><strong id="mp-odometry-turn">—</strong></div>
+<div><span>直线位移 cm</span><strong id="mp-odometry-distance">—</strong></div>
+<div><span>前进速度 m/s</span><strong id="mp-odometry-speed">—</strong></div>
+<div><span>转动速度 °/s</span><strong id="mp-odometry-rate">—</strong></div>
+</div><p id="mp-odometry-note" class="odometry-note">停车后设置起点，再对照卷尺。前进、左偏、左转为正。</p>
+<details class="odometry-raw"><summary>原始坐标与航向</summary><div>X <span id="mp-odometry-x">—</span> m · Y <span id="mp-odometry-y">—</span> m · θ <span id="mp-odometry-yaw">—</span>°</div><small id="mp-odometry-frame">等待坐标系</small></details>
+</section>
+<section class="mapping-only mapping-health" aria-label="建图状态"><div class="card-heading"><h2>当前状态</h2><span id="mp-status" class="status-pill">未连接</span></div><p id="mp-status-note">正在连接机器人…</p><div class="sensor-grid">
+<div><span class="sensor-label"><i id="mp-scan-dot"></i>雷达</span><strong id="mp-scan">等待数据</strong><small id="mp-scan-age">—</small></div>
+<div><span class="sensor-label"><i id="mp-odom-dot"></i>里程计</span><strong id="mp-odom">等待数据</strong><small id="mp-odom-age">—</small></div>
+<div><span class="sensor-label"><i id="mp-imu-dot"></i>GY-521</span><strong id="mp-imu">等待数据</strong><small id="mp-imu-age">—</small></div>
+</div><div class="motor-summary"><span>电机状态</span><strong id="mp-motor">未连接</strong></div></section><div class="control-intro"><span class="eyebrow">操作面板</span><h2>今天想让小犀做什么？</h2><p>手动驾驶，或按步骤建图、导航与巡检。</p></div>      <div id="drive" class="collapsed">
         <div id="drive-head">
           <div id="drive-title">手动驾驶</div>
           <div id="drive-head-right">
@@ -1786,7 +2120,7 @@ button:focus-visible,summary:focus-visible,a:focus-visible { outline:2px solid v
           </div>
         </div>
         <p class="task-help">先启用电机，再按住摇杆驾驶。松手即停止。</p>
-        <div id="speed-gears" role="group" aria-label="车速档位"><span>车速档位</span><button type="button" id="gear-low" aria-pressed="true">低速</button><button type="button" id="gear-high" aria-pressed="false">高速</button></div><div id="gear-hint">低速 · 油门上限 50%</div>
+        <div id="speed-gears" role="group" aria-label="车速档位"><span>车速档位</span><button type="button" id="gear-low" aria-pressed="true">低速30%</button><button type="button" id="gear-high" aria-pressed="false">高速</button></div><div id="gear-hint">低速 · 油门上限 30%</div>
         <div id="drive-btns">
           <button id="btn-arm" disabled>启用电机</button>
 
@@ -1833,19 +2167,19 @@ button:focus-visible,summary:focus-visible,a:focus-visible { outline:2px solid v
           <div id="gimbal-hint">云台:不必「启用电机」</div>
         </div>
       </div><div id="navigation-panel">
-<details class="task-group"><summary><span class="step">01</span> 建立地图</summary>
-<p class="task-help">第一次使用：启动建图，用上方摇杆缓慢移动，完成后保存地图。</p>
+<details class="task-group" id="mapping-actions"><summary><span class="step">01</span> 建立地图</summary><h2 class="mapping-only">建图操作</h2>
+<p class="task-help console-only">第一次使用：启动建图，用上方摇杆缓慢移动，完成后保存地图。</p><p class="mapping-only mapping-action-hint">启动后保持静止约 3 秒，等待陀螺仪校准。</p>
 <div class="nav-row"><button id="btn-map" disabled>建图</button></div>
-<div class="nav-row"><input id="nav-name" placeholder="地图英文名" maxlength="64"><button class="btn" id="nav-save">保存当前地图</button></div>
+<label class="mapping-only save-label" for="nav-name">地图名称</label><div class="nav-row save-map-row"><input id="nav-name" placeholder="例如 room_01" maxlength="64" autocomplete="off" spellcheck="false" aria-label="地图名称"><button class="btn" id="nav-save" disabled>保存地图</button></div><p class="mapping-only save-feedback" id="mp-save-feedback" role="status" aria-live="polite">支持英文字母、数字、下划线和短横线。</p><a class="mapping-only map-editor-link" href="/map-editor">地图清理 · 玻璃边界与伪区域 →</a>
 <details id="autonomy-panel"><summary>自动建图（需完成实车标定）</summary>
 <p class="task-help">准备 → 查看探索目标 → 开始；未完成标定时不能自动行驶。</p>
 <div class="nav-row"><button class="btn" id="auto-prepare">准备自动建图</button><button class="btn" id="auto-preview">查看探索目标</button></div><div class="nav-row"><button class="btn" id="auto-explore" disabled>开始自动建图</button><button class="btn" id="auto-finish" disabled>结束建图并保存</button></div>
 </details></details>
-<details class="task-group"><summary><span class="step">02</span> 定位与导航</summary>
+<details class="task-group console-only"><summary><span class="step">02</span> 定位与导航</summary>
 <p class="task-help">① 选地图并加载定位　② 在地图设置真实位置和朝向　③ 选择目标，预览后再开始导航。</p>
 <div class="nav-row"><select id="nav-map" aria-label="已保存地图"></select><button class="btn" id="nav-load">加载定位</button><button class="btn" id="nav-stop" disabled>停止定位</button></div><div class="nav-row"><button class="btn" id="nav-initial" disabled>设置当前位置</button><button class="btn" id="nav-target" disabled>选择目标并预览</button></div><div class="nav-row"><button class="btn" id="nav-go" disabled>开始导航</button><button class="btn" id="nav-cancel">取消导航</button></div>
 </details>
-<details class="task-group" id="patrol-panel"><summary><span class="step">03</span> 巡检任务</summary>
+<details class="task-group console-only" id="patrol-panel"><summary><span class="step">03</span> 巡检任务</summary>
 <p class="task-help">先完成定位，再选择任务。新任务需添加巡检点并保存；预览路线后再执行。</p>
 <div class="nav-row"><select id="patrol-list" aria-label="已保存巡检任务"></select><button class="btn" id="patrol-load">载入任务</button><button class="btn" id="patrol-new">新建</button></div>
 <details class="task-editor"><summary>新建 / 编辑巡检点</summary>
@@ -1855,17 +2189,20 @@ button:focus-visible,summary:focus-visible,a:focus-visible { outline:2px solid v
 <div id="patrol-draft-status">尚未配置巡检点</div><div id="patrol-status">仅配置和路线预览，不执行巡检</div>
 <a href="/inspection" target="_blank" rel="noopener" class="report-link">查看巡检记录与报告 ↗</a>
 </details>
-<div class="task-state"><strong>任务状态</strong>
+<div class="task-state console-only"><strong>任务状态</strong>
 <div id="nav-status">等待连接；先保存地图，再加载定位</div><div id="nav-path"></div><div id="auto-status" style="white-space:normal;line-height:1.6;margin-top:8px">等待连接；发现疑似火情即停车上报</div>
 <div class="nav-row"><button class="btn" id="auto-stop">停止自动任务</button><button class="btn" id="auto-ack" disabled>已人工确认告警</button></div>
 <a id="auto-report" hidden target="_blank" rel="noopener">查看本次巡检报告 ↗</a>
-</div></div></aside>
+</div></div><section class="control-only control-card" id="control-gimbal-panel" aria-label="云台控制"></section></aside>
+
+  <section class="control-only control-camera win" id="control-camera" aria-label="摄像头主画面"><header class="control-camera-head"><div><i id="ctl-camera-dot"></i><strong>摄像头画面</strong><span id="ctl-camera-state">等待连接</span></div><button type="button" id="ctl-video-toggle" aria-pressed="true" title="暂停或恢复摄像头画面">暂停画面</button></header><div class="control-video-body"><img id="ctl-video" alt="机器人摄像头实时画面" hidden><div id="ctl-video-placeholder" role="status"><span class="camera-placeholder-icon" aria-hidden="true">◉</span><strong id="ctl-video-message">正在连接摄像头…</strong><span id="ctl-video-help">画面就绪后可启用电机，使用摇杆驾驶。</span></div><span class="video-crosshair" aria-hidden="true"></span><span id="ctl-motor-badge" class="video-motor-badge">电机未启用</span></div><footer class="control-camera-foot"><span>松手即停 · 离开页面自动归零</span><span id="ctl-video-format">—</span><span id="ctl-video-latency" title="估计相机读出至网页解码的耗时；不含传感器曝光，网络按往返一半估算。">— ms</span><span id="ctl-video-fps">—</span></footer></section>
 
   <section class="win" id="win-map">
     <header class="win-title">
-      <span class="t">环境地图</span>
+      <span class="t">环境地图</span><span class="mapping-only map-live-label" id="mp-map-caption">等待地图</span>
       <span class="hud" id="hud">x:— y:— θ:—</span>
       <span class="grp">
+        <button type="button" class="btn mapping-only" id="mp-camera-toggle" aria-label="显示摄像头" aria-controls="mp-camera-window" aria-pressed="false" title="显示摄像头">相机</button>
         <button class="btn" id="btn-follow" title="跟随机器人">◉</button>
         <button class="btn" id="btn-zoomout" title="缩小">−</button>
         <button class="btn" id="btn-zoomin" title="放大">+</button>
@@ -1874,7 +2211,8 @@ button:focus-visible,summary:focus-visible,a:focus-visible { outline:2px solid v
       </span>
     </header>
     <div class="win-body" id="map-body">
-      <canvas id="c"></canvas><div id="map-empty"><strong>等待地图数据</strong><span>首次使用，请展开“建立地图”启动建图。<br>已有地图，请在“定位与导航”中加载。</span></div>
+      <section class="mapping-only mapping-camera" id="mp-camera-window" aria-label="实时摄像头" hidden><header><strong>实时摄像头</strong><span id="mp-camera-caption">等待画面</span><button type="button" id="mp-camera-close" aria-label="关闭摄像头" title="关闭摄像头">×</button></header><div class="camera-preview-body"><img id="mp-camera-image" alt="机器人摄像头实时画面" hidden><div id="mp-camera-message" role="status">等待画面</div></div></section>
+      <canvas id="c" aria-label="实时环境地图"></canvas><div class="mapping-only map-guide">拖动平移<span>·</span>滚轮缩放<span>·</span>双击跟随</div><section class="mapping-only map-position" aria-label="位置、航向与加速度"><div class="map-pose-row"><div><span>X / 米</span><strong id="mp-x">—</strong></div><div><span>Y / 米</span><strong id="mp-y">—</strong></div><div><span>航向角 / 地图坐标</span><strong id="mp-yaw">—</strong></div></div><div class="map-accel-heading"><span>三轴加速度 · m/s²</span><small id="mp-accel-state">等待数据</small></div><div class="map-accel-row"><div><span>X 轴</span><strong id="mp-accel-x">—</strong></div><div><span>Y 轴</span><strong id="mp-accel-y">—</strong></div><div><span>Z 轴</span><strong id="mp-accel-z">—</strong></div></div><div class="map-accel-note"><span>模块坐标 · 含重力</span><span>合值 <b id="mp-accel-total">—</b></span></div></section><div id="map-empty"><strong>等待地图数据</strong><span>首次使用，请展开“建立地图”启动建图。<br>已有地图，请在“定位与导航”中加载。</span></div>
       <div id="legend">
         <span class="lg"><i style="background:#999"></i>地图</span>
         <span class="lg"><i style="background:#00d2ff"></i>&lt;1m</span>
@@ -1919,6 +2257,9 @@ button:focus-visible,summary:focus-visible,a:focus-visible { outline:2px solid v
 
 <script>
 // ── 状态 ─────────────────────────────────────────────────────────
+const mappingPage = document.body.classList.contains('mapping-page');
+const controlPage = document.body.classList.contains('control-page');
+const missionPage = document.body.classList.contains('mission-page');
 const canvas = document.getElementById('c');
 const ctx = canvas.getContext('2d');
 const mapBody = document.getElementById('map-body');
@@ -1950,7 +2291,7 @@ new ResizeObserver(resize).observe(mapBody);
 resize();
 
 // ── SocketIO ────────────────────────────────────────────────────
-const socket = io();
+const socket = io({query:{view:controlPage ? 'control' : mappingPage || missionPage ? 'mapping' : 'console'}});
 const connDot = document.getElementById('conn-dot');
 const connText = document.getElementById('conn-text');
 
@@ -1958,7 +2299,7 @@ socket.on('connect', () => {
   connDot.className = 'live';
   connText.textContent = '已连接';
   // 只开启检测画面，避免重复传输原始相机流
-  socket.emit('fire_control', { action: 'start' });
+  if (!mappingPage && !controlPage && !missionPage) socket.emit('fire_control', { action: 'start' });
 });
 
 socket.on('disconnect', () => {
@@ -2117,6 +2458,7 @@ document.getElementById('btn-log-collapse').addEventListener('click', () => {
 });
 
 function updateGridClasses() {
+  if (mappingPage || controlPage || missionPage) return;
   const collapsed = document.getElementById('win-log').classList.contains('collapsed');
   document.getElementById('workspace').style.gridTemplateRows =
     'minmax(260px,1fr) minmax(180px,.62fr) ' + (collapsed ? '42px' : '180px');
@@ -2130,6 +2472,25 @@ let driverSid = null;    // 当前驾驶者的 sid; null = 还没人被授权
 // 云台当前操作者的 sid。**与 driverSid 完全独立** —— 服务端也是两套仲裁
 // (_gimbal_owner / _drive_owner)。复用一个就会把云台重新绑回 armed 门上。
 let gimbalOwner = null;
+let driveClock = null; // Conservative server-monotonic anchor at ACK receipt.
+let driveClockEpoch = 0, driveSyncPending = 0, driveSyncSerial = 0;
+function syncDriveClock() {
+  if (!controlPage || !socket.connected || document.hidden || driveSyncPending) return;
+  const start = performance.now(), epoch = driveClockEpoch, token = ++driveSyncSerial;
+  driveSyncPending = token;
+  socket.emit('drive_sync', serverTime => {
+    if (epoch !== driveClockEpoch || driveSyncPending !== token) return;
+    driveSyncPending = 0;
+    const received = performance.now(), rtt = received-start;
+    if (!socket.connected || document.hidden || typeof serverTime !== 'number' || !Number.isFinite(serverTime) || rtt < 0 || rtt > 150) return;
+    // Do not add half the RTT: the estimate must never date a command in the future.
+    driveClock = {server:serverTime, local:received};
+  });
+  setTimeout(() => { if (driveSyncPending === token) driveSyncPending = 0; }, 1000);
+}
+socket.on('connect', () => { driveClockEpoch++; driveClock=null; driveSyncPending=0; syncDriveClock(); });
+socket.on('disconnect', () => { driveClockEpoch++; driveClock=null; driveSyncPending=0; });
+if (controlPage) setInterval(syncDriveClock, 2000);
 const btnArm = document.getElementById('btn-arm');
 const btnEstop = document.getElementById('btn-estop');
 const valEl = document.getElementById('drive-val');
@@ -2191,12 +2552,39 @@ let joyMode = 'dual';
 // ⚠️ 别动上面的 MODE_PADS —— web_drive_test.js 有精确正则钉死它。
 const GIMBAL_MODE_PADS = { dual: [PADS.gimbalPan, PADS.gimbalTilt], single: [PADS.gimbal] };
 let gimbalMode = 'single';
+let gimbalWasMoving = false;
 
 // 同一份页面开在两台设备上时,双边都会 20Hz 发 /cmd_vel,没握摇杆的那台
 // 持续灌 0 → 真值被切断 → 电机抖。服务端只认驾驶者,这里同步禁掉非驾驶者
 // 的发送与操作,免得用户对着没反应的摇杆使劲。
 function isDriver() {
   return !armed || driverSid === null || driverSid === mySid;
+}
+
+function sendDriveTarget(linear, angular, takeover=false, periodic=false) {
+  const payload = {action:'vel', linear, angular};
+  if (takeover) payload.takeover = true;
+  if (controlPage) {
+    if (!socket.connected) return;
+    const moving = linear !== 0 || angular !== 0;
+    if (moving) {
+      if (driveClock === null) return; // Wait for bounded clock alignment before motion.
+      const elapsed = performance.now()-driveClock.local;
+      if (elapsed < 0 || elapsed > 30000) {
+        driveClock = null;
+        socket.emit('motor_control', {action:'arm', armed:false});
+        return; // Clock failure requires a new explicit arm; never resumes itself.
+      }
+      payload.sent_monotonic = driveClock.server+elapsed/1000;
+    }
+    // All periodic state (including neutral) is replaceable. Explicit release/stop
+    // remains reliable and untimestamped: an old zero can never authorize motion.
+    if ((periodic || moving) && socket.volatile) {
+      socket.volatile.emit('motor_control', payload);
+      return;
+    }
+  }
+  socket.emit('motor_control', payload);
 }
 
 function driveGate() {
@@ -2365,7 +2753,12 @@ socket.on('disconnect', () => mapUi(false));
 
 // 键盘 WASD / 方向键 (页面聚焦时; 松开即回零)
 const keys = {};
+function editingText(target) {
+  return target && (target.isContentEditable || ['INPUT','TEXTAREA','SELECT'].includes(target.tagName));
+}
+document.addEventListener('focusin', e => { if (editingText(e.target)) releaseAll(); });
 document.addEventListener('keydown', e => {
+  if (missionPage || editingText(e.target)) return;
   if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
   if (e.repeat) return;
   keys[e.key] = true;
@@ -2450,7 +2843,7 @@ function releaseAll(keepPointer) {
   }
   padsReset();
   if (armed && isDriver()) {
-    socket.emit('motor_control', { action: 'vel', linear: 0, angular: 0, takeover: true });
+    sendDriveTarget(0, 0, true);
   }
   // ⚠️⚠️ 云台零速帧 **无条件发**,两处刻意与上面那条不同:
   //   ① **不判 armed / isDriver()**。云台的典型工况恰恰是「没启用电机、只在转
@@ -2467,9 +2860,11 @@ function releaseAll(keepPointer) {
   // ⚠️ 未连接时 socket.emit 是空操作,不必额外判连接。
   // ⚠️ 不是操作者时服务端会把这包零丢掉(它只认操作者的零)—— 那正是我们要的:
   //    别人松手不该把云台拽停。
-  socket.emit('gimbal_control', { action: 'vel', dx: 0, dy: 0 });
+  if (!mappingPage && !missionPage) socket.emit('gimbal_control', { action: 'vel', dx: 0, dy: 0 });
 }
 window.addEventListener('blur', () => releaseAll(true));
+window.addEventListener('pagehide', () => { releaseAll(); setDriveRunning(false); });
+window.addEventListener('pageshow', () => setDriveRunning(!document.hidden));
 document.addEventListener('visibilitychange', () => {
   // 不可见时**两件事都要做**:① 清掉残留的按键/摇杆并补发一次零速;② 停掉
   // 发送定时器 —— 光做 ① 是不够的,被钳到 1Hz 的定时器会继续发零速包,而
@@ -2506,6 +2901,7 @@ try {
 for (const b of modeBtns) b.classList.toggle('on', b.dataset.mode === joyMode);
 
 // Manual throttle range only; each page starts low, never restores high speed.
+const LOW_GEAR_MAX = 0.30;
 let speedGear = 'low';
 function setSpeedGear(gear) {
   const next = gear === 'high' ? 'high' : 'low';
@@ -2517,7 +2913,7 @@ function setSpeedGear(gear) {
     button.setAttribute('aria-pressed', String(speedGear === value));
   }
   document.getElementById('gear-hint').textContent = speedGear === 'low'
-    ? '低速 · 油门上限 50% · 适合建图' : '高速 · 原有油门范围 · 注意周围环境';
+    ? `低速 · 油门上限 ${Math.round(LOW_GEAR_MAX * 100)}%` : '高速 · 原有油门范围 · 注意周围环境';
 }
 document.getElementById('gear-low').addEventListener('click', () => setSpeedGear('low'));
 document.getElementById('gear-high').addEventListener('click', () => setSpeedGear('high'));
@@ -2543,7 +2939,7 @@ function setGimbalMode(m) {
   for (const b of gimbalModeBtns) b.classList.toggle('on', b.dataset.mode === gimbalMode);
   try { localStorage.setItem('gimbalMode', gimbalMode); } catch (_) {}
   // 立刻补发云台零速(与 releaseAll 里那条同样的理由:命令式直接 emit,别交给定时器)。
-  socket.emit('gimbal_control', { action: 'vel', dx: 0, dy: 0 });
+  if (!mappingPage && !missionPage) socket.emit('gimbal_control', { action: 'vel', dx: 0, dy: 0 });
   gimbalGate();
 }
 for (const b of gimbalModeBtns) {
@@ -2573,7 +2969,7 @@ function driveTarget() {
   if (keys['a'] || keys['ArrowLeft']) a += 1;
   if (keys['d'] || keys['ArrowRight']) a -= 1;
   return {
-    l: Math.max(-1, Math.min(1, l)) * (speedGear === 'low' ? 0.5 : 1),
+    l: Math.max(-1, Math.min(1, l)) * (speedGear === 'low' ? LOW_GEAR_MAX : 1),
     a: Math.max(-1, Math.min(1, a)),
   };
 }
@@ -2604,10 +3000,13 @@ const DRIVE_PERIOD_MS = 16;
 let driveTimer = null;
 
 function driveTick() {
+  // Mission pages use Nav2's owned control loop and separate heartbeat.
+  // Hidden manual controls must not flood SocketIO/DDS with 60Hz zero commands.
+  if (missionPage) return;
   const t = driveTarget();
   valEl.textContent = '前进 ' + fmtSigned(t.l) + '　转向 ' + fmtSigned(t.a);
   if (!armed || !isDriver()) return;
-  socket.emit('motor_control', { action: 'vel', linear: t.l, angular: t.a });
+  sendDriveTarget(t.l, t.a, false, true);
 }
 
 // ── 云台 ────────────────────────────────────────────────────────
@@ -2628,6 +3027,7 @@ function driveTick() {
 // 与驾驶摇杆的「上=前进、右=右转」是同一套直觉,别单独翻其中一个。
 const GIMBAL_SCALE = 100;
 function gimbalTick() {
+  if (mappingPage || missionPage) return;
   // 只读当前云台模式的那几个盘(GIMBAL_MODE_PADS);单轴盘的死轴恒 0,
   // 所以一个式子对两种盘都成立,不必按模式分支(与 driveTarget 同理)。
   let dx = 0, dy = 0;
@@ -2640,6 +3040,11 @@ function gimbalTick() {
   // 非驾驶者的读数照常刷新(方便先看清数值再动),但没连接就别发 —— 发了也没人收,
   // 只会让 read() 之类的计数出现幻影包。
   if (!socket.connected) return;
+  // Idle non-operators cannot affect the gimbal. Avoid 60 discarded requests/s
+  // on the camera-first page; explicit release/blur still sends zero immediately.
+  const moving = dx !== 0 || dy !== 0;
+  if (controlPage && !moving && !gimbalWasMoving && gimbalOwner !== mySid) return;
+  gimbalWasMoving = moving;
   socket.emit('gimbal_control', { action: 'vel', dx: dx, dy: dy });
 }
 
@@ -2800,6 +3205,7 @@ function drawScaleBar() {
 }
 
 function render(ts) {
+  if (controlPage) return;
   frameCount++;
   if (ts - lastFpsTime > 1000) {
     fps = Math.round(frameCount / ((ts - lastFpsTime) / 1000));
@@ -2898,11 +3304,18 @@ canvas.addEventListener('dblclick', () => { fitView(); setFollow(true); });
 socket.once('map', () => { fitView(); setFollow(true); });
 requestAnimationFrame(render);
 </script>
-<script src="/navigation.js"></script>
+<script src="/navigation.js?v=20261021-missions1"></script>
+<script src="/mapping.js?v=20261023-odom1"></script>
+<script src="/control.js?v=20261021-drive3"></script>
 <script src="/autonomy.js"></script>
+<script src="/missions.js?v=20261023-navigation1"></script>
+<script src="/navigation_page.js?v=20261023-navigation1"></script>
 </body>
 </html>"""
 
+
+from map_editor import register_map_editor
+register_map_editor(app, lambda: _ros_node, lambda: _navigation)
 
 if __name__ == "__main__":
     main()

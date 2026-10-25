@@ -1,0 +1,14 @@
+{
+  "folder": "/home/aidlux/robot/data/maps/mapping_check_20261023_133325_863e99",
+  "width": 307,
+  "height": 216,
+  "resolution": 0.05000000075,
+  "origin": [
+    -5.815163654548354,
+    -5.640134220075563,
+    0.0
+  ],
+  "pgm_bytes": 66327,
+  "sha256": "eeed73a8e8c2e5a3462ffa74610e221ea1db60d53bed74595e9b1bbe8e05e653",
+  "valid": true
+}

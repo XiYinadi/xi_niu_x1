@@ -2,14 +2,35 @@
 # Localization and planning are available without a motion calibration.
 calibrated: false
 wheelbase_m: 0.300
-length_m: 0.444
-width_m: 0.360
+# Operator tape measurements 2026-10-24, including protruding equipment.
+base_reference: rear_axle_midpoint
+front_extent_m: 0.400
+rear_extent_m: 0.030
+length_m: 0.430
+width_m: 0.355
 max_steering_rad: null
 # Velocity represented by normalized throttle=1. Measure, do not use web MAX_LIN.
 full_throttle_mps: null
-# ROS positive angular.z is left; legacy joystick positive a is right.
-steering_sign: -1
-max_speed_mps: 0.10
-command_timeout_s: 0.25
-scan_timeout_s: 0.5
+# Physical stationary trials: positive joystick a turns vehicle LEFT.
+steering_sign: 1
+max_speed_mps: 0.12   # 2026-10-24 抬包络：原 0.05 是 6.5/95cm 实车验证值；
+                      # 0.12 属于未标定实验包络（calibrated 仍为 false）
+command_timeout_s: 0.25   # 传感器超时 0.4s 是试航模式的硬上限（navigation_drive.validate_navigation）；
+                          # 进程自身停顿造成的误判由 runtime.tick 的 stall 补偿处理
+scan_timeout_s: 0.4
+odom_timeout_s: 0.4
+imu_timeout_s: 0.4
 localization_timeout_s: 3.0
+# User requested functional navigation first, precision tuning later (2026-10-24).
+# Keep calibrated=false: the 95cm/100.1cm error and dynamic turning remain open.
+# Only supervised SINGLE goals are enabled by this separate bounded profile.
+navigation_mode: supervised_trial
+trial_pwm_cap: 0.20
+trial_max_steering_rad: 0.3490658503988659
+trial_max_joystick: 0.70
+trial_max_duration_s: 45.0
+trial_max_goal_m: 1.0
+trial_max_travel_m: 1.15
+trial_max_path_m: 1.2
+trial_clearance_m: 0.20
+trial_evidence: "Forward feedback controller used in 6.5cm and 95cm physical runs at <=10% PWM; both +/-0.5 stationary steering points measured about15deg. Interpolation and turning dynamics are provisional; no full-throttle assumption."

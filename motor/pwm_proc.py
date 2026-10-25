@@ -213,7 +213,7 @@ class PwmProc:
         self._flip_l = bool(p.get('flip_left', False))
         self._flip_r = bool(p.get('flip_right', False))
         self._max_duty = float(p.get('max_duty', 0.9))
-        self._deadband = float(p.get('pid_deadband', 0.05))
+        self._deadband = float(p.get('pwm_deadband', p.get('pid_deadband', 0.05)))
         self._pwm_freq = float(p.get('pwm_freq', 1000.0))
         self._rate_hz = float(p.get('pwm_cmd_hz', DEFAULT_HZ))
         self._deadman = float(p.get('pwm_deadman_ms', DEFAULT_DEADMAN_MS)) / 1000.0
@@ -248,6 +248,13 @@ class PwmProc:
                      % self._steer_mode)
         self._a_to_wheels = self._steer_mode in ('diff', 'both')
         self._a_to_servo = self._steer_mode in ('servo', 'both')
+        # Temporary, supervised skid-turn acceptance only. Keep front steering
+        # centered while differential drive turns the rear wheels. Default off.
+        self._hold_center = p.get('servo_hold_center', False) is True
+        if self._hold_center:
+            if self._steer_mode != 'diff' or not self._servo_enable:
+                sys.exit('servo_hold_center requires diff mode and an enabled servo')
+            self._a_to_servo = True
 
         # 硬件:方向脚 + 软 PWM。编码器不开 —— 本进程只驱动,不做里程计。
         try:
@@ -450,7 +457,7 @@ class PwmProc:
             elif idle_now:
                 self.servo.park()
             else:
-                self.servo.set_command(self._a)
+                self.servo.set_command(0.0 if self._hold_center else self._a)
 
     def _log(self, msg):
         print('[pwm_proc] %s' % msg, flush=True)

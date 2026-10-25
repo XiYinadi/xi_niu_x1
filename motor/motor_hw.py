@@ -126,19 +126,24 @@ class DualSoftPwm:
                 self._busy_until(t0 + hl)
                 if hl > 0.0:
                     self._l.set_value(0)
-                self._busy_until(t0 + period)
+                self._busy_until(t0 + hr)
                 self._r.set_value(0)
             elif hr < hl:
                 self._busy_until(t0 + hr)
                 if hr > 0.0:
                     self._r.set_value(0)
-                self._busy_until(t0 + period)
+                self._busy_until(t0 + hl)
                 self._l.set_value(0)
             else:
                 # 走到这里必有 hl == hr > 0:两者同为 0 已在上面 park 分支拦掉。
                 self._busy_until(t0 + hl)
                 self._l.set_value(0)
                 self._r.set_value(0)
+
+            # Both outputs must remain LOW for the rest of this PWM period.
+            # Without this wait, equal 10% commands repeat after only 0.1ms,
+            # producing nearly continuous HIGH instead of 1kHz / 10% duty.
+            self._busy_until(t0 + period)
 
     # 忙等的精度余量:超过它就先 sleep,只有最后这段才自旋。
     # 取值权衡:内核 sleep 的过冲通常在 50~100µs,余量必须远大于它才能把

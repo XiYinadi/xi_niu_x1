@@ -12,6 +12,6 @@ slam_toolbox:
     minimum_travel_heading: 0.05
     min_laser_range: 0.2
     max_laser_range: 12.0
+    minimum_time_interval: 0.05  # Independent of TF timeout; keep moving scan constraints
     transform_timeout: 0.3
-    scan_queue_size: 1
     throttle_scans: 1

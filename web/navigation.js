@@ -1,9 +1,10 @@
 // Uses the existing socket/driver identity; never creates a competing client.
 (() => {
+  if ((typeof mappingPage !== 'undefined' && mappingPage) || (typeof controlPage !== 'undefined' && controlPage)) return;
   const el = id => document.getElementById(id);
   const stateEl = el('nav-status');
   const select = el('nav-map');
-  let state = null, pick = null, anchor = null, target = null;
+  let state = null, pick = null, anchor = null, target = null, pickTip = null, pickStart = null;
   let draft = { name:'', map:'', cycles:1, revision:0, waypoints:[] }, dirty = false;
   let previewMode = 'single';
   const send = (action, extra = {}) => {
@@ -16,7 +17,7 @@
     send('load', { name: select.value });
   });
   el('nav-stop').addEventListener('click', () => send('stop'));
-  el('nav-cancel').addEventListener('click', () => { pick = null; send('cancel'); });
+  el('nav-cancel').addEventListener('click', () => { pick = null;anchor=null;pickTip=null;pickStart=null;canvas.navPick=null;canvas.navPickNotice='';send('cancel'); });
   const beginPick = type => {
     if (!state || !state.running) { stateEl.textContent = '请先加载地图'; return; }
     if (type === 'goal' && !state.localized) { stateEl.textContent = '请先设置初始位置并等待定位'; return; }
@@ -27,6 +28,8 @@
       stateEl.textContent = '每个任务最多 50 个巡检点'; return;
     }
     pick = type;
+    anchor = null; pickTip = null; pickStart = null;
+    canvas.navPick = type; canvas.navPickNotice = '';
     previewMode = type === 'goal' ? 'single' : null;
     target = null;
     el('nav-go').disabled = true;
@@ -35,7 +38,8 @@
   el('nav-initial').addEventListener('click', () => beginPick('initial_pose'));
   el('nav-target').addEventListener('click', () => beginPick('goal'));
   el('nav-go').addEventListener('click', () => {
-    if (target && state && state.localized && state.navigator_ready && !state.calibration_error) send('goal', target);
+    const blocked=state && ('drive_error' in state ? state.drive_error : state.calibration_error);
+    if (target && state && state.localized && state.navigator_ready && !blocked && (state.drive_mode!=='supervised_trial'||state.preview_valid)) send('goal', target);
   });
   const world = e => {
     const rect = canvas.getBoundingClientRect();
@@ -48,16 +52,24 @@
     if (!pick) return;
     intercept(e);
     anchor = world(e);
+    pickTip = anchor; pickStart = {x:e.clientX,y:e.clientY};
     try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
   }, true);
-  canvas.addEventListener('pointermove', e => { if (pick) intercept(e); }, true);
+  canvas.addEventListener('pointermove', e => { if (pick) {intercept(e);if(anchor)pickTip=world(e);} }, true);
   canvas.addEventListener('pointerup', e => {
     if (!pick || !anchor) return;
     intercept(e);
     const tip = world(e);
+    if (pickStart && Math.hypot(e.clientX-pickStart.x,e.clientY-pickStart.y)<8) {
+      anchor=null;pickTip=null;pickStart=null;
+      canvas.navPickNotice='请按住当前位置，沿真实车头方向拖出一段箭头，再松开提交';
+      stateEl.textContent=canvas.navPickNotice;
+      try {canvas.releasePointerCapture(e.pointerId);}catch(_){}
+      return;
+    }
     const pose = { ...anchor, yaw: Math.atan2(tip.y-anchor.y, tip.x-anchor.x) };
     const action = pick;
-    pick = null; anchor = null;
+    pick = null; anchor = null; pickTip = null; pickStart = null;canvas.navPick=null;canvas.navPickNotice='';
     try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
     if (action === 'patrol') {
       if (!state || !state.running) return;
@@ -68,7 +80,7 @@
     else if (action === 'initial_pose') send(action, pose);
     else { target = pose; send('preview', pose); }
   }, true);
-  canvas.addEventListener('pointercancel', () => { pick = null; anchor = null; });
+  canvas.addEventListener('pointercancel', () => { pick = null; anchor = null;pickTip=null;pickStart=null;canvas.navPick=null;canvas.navPickNotice=''; });
   const paintDraft = () => {
     el('patrol-map').textContent = '绑定地图：'+(draft.map || '添加首个点时绑定当前定位地图');
     el('patrol-points').innerHTML = draft.waypoints.map((p,i) => '<li style="margin:6px 0">'
@@ -127,23 +139,24 @@
   paintDraft();
   socket.on('navigation_error', d => { stateEl.textContent = d.message; });
   socket.on('navigation_state', d => {
-    if (state && d.selected_map !== state.selected_map) { target=null;pick=null;anchor=null;previewMode=null; }
+    if (state && d.selected_map !== state.selected_map) { target=null;pick=null;anchor=null;pickTip=null;pickStart=null;canvas.navPick=null;canvas.navPickNotice='';previewMode=null; }
     state = d;
     if (d.running) trajectoryPoints = [];
     const selected = select.value;
     select.innerHTML = (d.maps || []).map(name => '<option value="'+name+'">'+name+'</option>').join('');
     if ((d.maps || []).includes(selected)) select.value = selected;
     else if (d.selected_map) select.value = d.selected_map;
-    stateEl.textContent = d.message + (d.calibration_error ? '；'+d.calibration_error : '');
+    const blocked='drive_error' in d?d.drive_error:d.calibration_error;
+    stateEl.textContent = d.message + (blocked ? '；'+blocked : '');
     el('nav-load').disabled = d.busy || d.running;
     el('nav-save').disabled = d.busy;
     el('nav-initial').disabled = !d.initial_pose_ready || d.busy;
     el('nav-target').disabled = !d.localized || d.busy;
-    el('nav-go').disabled = !target || !d.localized || !d.navigator_ready || !!d.calibration_error || d.navigating || d.busy;
+    el('nav-go').disabled = !target || !d.localized || !d.navigator_ready || !!blocked || (d.drive_mode==='supervised_trial'&&!d.preview_valid) || d.navigating || d.busy;
     el('nav-stop').disabled = !d.running || d.busy;
     el('nav-stop').textContent = d.mode==='mapping'?'停止建图管线':'停止定位';
     if (d.pose) { robotPose = d.pose; }
-    el('nav-path').textContent = d.path && d.path.length ? '路径预览：'+d.path.length+' 个点（未行驶）' : '';
+    el('nav-path').textContent = d.path && d.path.length ? (d.navigating?'导航路径：':'路径预览：')+d.path.length+' 个点'+(d.navigating&&Number.isFinite(d.goal_distance_m)?' · 距目标约 '+d.goal_distance_m.toFixed(2)+' m':'') : '';
     const taskList=el('patrol-list'), previous=taskList.value;
     taskList.innerHTML=(d.patrols || []).map(t=>'<option value="'+t.name+'">'+t.name+' · '+t.points+'点 · '+t.map+'</option>').join('');
     if ((d.patrols || []).some(t=>t.name===previous)) taskList.value=previous;
@@ -155,6 +168,7 @@
   });
   socket.on('disconnect', () => {
     pick = null; anchor = null; target = null; state = null;previewMode=null;
+    pickTip=null;pickStart=null;canvas.navPick=null;canvas.navPickNotice='';
     stateEl.textContent = '连接已断开，导航不可用';
     for (const id of ['nav-load','nav-save','nav-initial','nav-target','nav-go','nav-stop','patrol-add','patrol-preview','patrol-save','patrol-load','patrol-new']) el(id).disabled = true;
   });
@@ -166,9 +180,16 @@
   document.addEventListener('visibilitychange', () => { if (document.hidden) cancelOnLeave(); });
   // Path is drawn in map coordinates with the same viewport as the map.
   const originalRender = render;
-  render = function() {
-    originalRender();
+  render = function(ts) {
+    originalRender(ts);
     if (!state) return;
+    if(pick&&anchor&&pickTip){
+      const a=w2s(anchor.x,anchor.y),b=w2s(pickTip.x,pickTip.y),angle=Math.atan2(b.y-a.y,b.x-a.x);
+      ctx.save();ctx.strokeStyle='#8ae3c5';ctx.fillStyle='#8ae3c5';ctx.lineWidth=3;ctx.setLineDash([5,3]);
+      ctx.beginPath();ctx.arc(a.x,a.y,6,0,Math.PI*2);ctx.stroke();ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();ctx.setLineDash([]);
+      ctx.beginPath();ctx.moveTo(b.x,b.y);ctx.lineTo(b.x-10*Math.cos(angle-.4),b.y-10*Math.sin(angle-.4));ctx.lineTo(b.x-10*Math.cos(angle+.4),b.y-10*Math.sin(angle+.4));ctx.closePath();ctx.fill();
+      ctx.font='12px sans-serif';ctx.fillText('松开后提交朝向',a.x+10,a.y-12);ctx.restore();
+    }
     const route=state.patrol_preview;
     const path = previewMode === 'patrol' ? (route && route.path || []) : previewMode === 'single' ? state.path || [] : [];
     if (path.length > 1) {
