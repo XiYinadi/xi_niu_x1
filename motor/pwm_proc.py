@@ -422,11 +422,12 @@ class PwmProc:
             # **不要**再套 swap_lr/左右互换 —— 那会让两轮同向（实测 dir L=0 R=0）。
             f_l = -1.0 if self._flip_l else 1.0
             f_r = -1.0 if self._flip_r else 1.0
-            want_l = rot > 0
-            want_r = rot < 0
+            # 前进 = dir L=1 R=0（通道 L 经 flip 反相）⇒ 物理同向不是 dir 相同。
+            # 左转(rot>0) = (1,1)；右转(rot<0) = (0,0)。
+            want = rot > 0
             spin = min(1.0, abs(rot))
-            s_l = spin if (want_l == (f_l > 0)) else -spin
-            s_r = spin if (want_r == (f_r > 0)) else -spin
+            s_l = spin if (want == (f_l > 0)) else -spin
+            s_r = spin if (want == (f_r > 0)) else -spin
         elif stale or not self._armed:
             s_l = s_r = 0.0
         else:

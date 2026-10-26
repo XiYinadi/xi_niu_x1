@@ -257,7 +257,12 @@ class PatrolRunner:
         """原地旋转对准目标航向；对准后自动进入正常导航。"""
         pose = self.nav.last_pose
         if pose is None:
-            raise ValueError('定位失效，巡检停止')
+            self.pose_lost = getattr(self, 'pose_lost', None) or now
+            if now - self.pose_lost > 1.5:
+                raise ValueError('定位失效，巡检停止')
+            self.nav.send_drive(0., 0., self.nav.armed(), 0.)
+            return
+        self.pose_lost = None
         error = math.atan2(math.sin(self.rotate_target-pose['yaw']), math.cos(self.rotate_target-pose['yaw']))
         if abs(error) < .10:
             self.nav.send_drive(0., 0., self.nav.armed(), 0.)
@@ -287,8 +292,15 @@ class PatrolRunner:
         """短腿直行：先对准方位，再低速直行，靠近后对准点位朝向。"""
         pose = self.nav.last_pose
         target = self.leg_target
-        if pose is None or target is None:
-            raise ValueError('定位失效，巡检停止')
+        if target is None:
+            raise ValueError('缺少点位目标，巡检停止')
+        if pose is None:
+            self.pose_lost = getattr(self, 'pose_lost', None) or now
+            if now - self.pose_lost > 1.5:
+                raise ValueError('定位失效，巡检停止')
+            self.nav.send_drive(0., 0., self.nav.armed(), 0.)
+            return
+        self.pose_lost = None
         distance = math.hypot(target['x']-pose['x'], target['y']-pose['y'])
         if distance < .10:
             self.nav.send_drive(0., 0., self.nav.armed(), 0.)
