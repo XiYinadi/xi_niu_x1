@@ -120,7 +120,9 @@
   state.sourceBusy=true;buttons();status('正在载入地图快照…');
   try{const result=await api('source',{source,name}),image=await decode(result.image);state.source=result;state.image=image;state.originalImage=image;state.operations=[];state.redo=[];state.draft=[];state.changed=0;state.revision=0;state.previewRevision=0;state.savedRevision=-1;state.saveRequest=null;
    el('empty').hidden=true;el('retry-preview').hidden=true;el('open-saved').hidden=true;el('source-info').textContent=`${source==='live'?'当前地图快照':result.source} · ${result.width} × ${result.height} · ${(result.resolution*100).toFixed(1)} cm/格`;
-   const suffix=new Date().toISOString().replace(/\D/g,'').slice(0,14);el('save-name').value=(source==='live'?'map':name.slice(0,35))+'_clean_'+suffix;state.mode='view';fit();state.regions=[];state.regionDirty=false;status('快照已载入。先清理伪区域，再沿玻璃补画墙线；也可以划分房间区域。');
+   const suffix=new Date().toISOString().replace(/\D/g,'').slice(0,14);el('save-name').value=(source==='live'?'map':name.slice(0,35))+'_clean_'+suffix;state.mode='view';fit();state.regions=[];state.regionDirty=false;
+   if(source==='saved'){try{const rr=await api('regions?name='+encodeURIComponent(result.source));state.regions=rr.regions||[];}catch(_){state.regions=[];}}
+   buttons();draw();status('快照已载入。先清理伪区域，再沿玻璃补画墙线；也可以划分房间区域。');
   }catch(error){status(error.message,true);}finally{state.sourceBusy=false;mode(state.mode,false);buttons();}
  }
  el('delete-map').addEventListener('click',async()=>{
