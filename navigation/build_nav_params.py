@@ -42,12 +42,14 @@ def build():
         if key == 'global_costmap':
             p['static_layer'].update(map_subscribe_transient_local=True,subscribe_to_updates=True)
     planning_steering=cfg['trial_max_steering_rad']*.95 if trial else (cfg.get('max_steering_rad') or .4)
-    radius = (cfg.get('wheelbase_m') or 0.4) / math.tan(planning_steering)
+    # 2026-10-25: 理论半径（轮距/tan 舵角）比实车小，允许配置直接覆盖。
+    radius = float(cfg.get('planning_turning_radius_m') or 0.0) or \
+        (cfg.get('wheelbase_m') or 0.4) / math.tan(planning_steering)
     planner = data['planner_server']['ros__parameters']
     planner['planner_plugins'] = ['GridBased']
     planner['GridBased'] = dict(plugin='nav2_smac_planner/SmacPlannerHybrid',
         tolerance=0.15, downsample_costmap=False, allow_unknown=True,
-        max_iterations=100000, max_planning_time=3.0, motion_model_for_search='DUBIN',
+        max_iterations=200000, max_planning_time=5.0, motion_model_for_search='DUBIN',
         angle_quantization_bins=72, minimum_turning_radius=radius,
         analytic_expansion_ratio=3.5, analytic_expansion_max_length=max(3.0, 4*radius))
     controller = data['controller_server']['ros__parameters']

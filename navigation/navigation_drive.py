@@ -47,8 +47,13 @@ class TrialDrive:
         # 0.15s 是「20Hz 控制节拍」的假设，但控制循环跑在网页广播循环里，
         # load 高时一次 emit 就能超过它。Feedback 内部本来就把 dt 钳到 0.04，
         # 所以这里只兜「循环真的冻住」，正常抖动交给它自己积分。
-        if not all(math.isfinite(x) for x in (v,w,measured_v,dt)) or not 0<dt<=.5:
+        if not all(math.isfinite(x) for x in (v,w,measured_v,dt)):
             raise ValueError('速度反馈或控制节拍异常')
+        if not 0 < dt <= .5:
+            # 2026-10-26: 进程停顿（VLM 推理等）会让 dt 变成数秒。
+            # 这不是控制故障 —— 重置反馈、这一帧输出 0，下一帧照常。
+            self.reset()
+            return 0., 0.
         if v<0 or v>self.config['max_speed_mps']+.001:raise ValueError('试航仅允许0至%.2f m/s前进'%self.config['max_speed_mps'])
         # 2026-10-25: 单帧尖峰不中止；连续 3 帧超 0.60 m/s 才判异常。
         # 控制用的速度钳到 ±0.5，尖峰不直接进反馈环。

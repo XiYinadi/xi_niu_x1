@@ -39,7 +39,7 @@
     el('patrol-panel').open=true;
     el('patrol-panel').querySelector('.task-editor').open=true;
     move('mission-run-controls','auto-patrol');
-    el('mission-preview-note').textContent='新建或载入任务，在地图添加点位与朝向，保存后预览路线。巡检发现疑似火情会停车并保留证据。';
+    el('mission-preview-note').textContent='新建或载入任务，在地图添加点位与朝向，保存后预览路线。到点停稳后拍照检测、保存记录，再前往下一点；疑似火情或不确定结果会停止任务。';
   }
   // Same driver SID, arm button and emergency stop; no second control client.
   move('mission-run-controls','btn-arm');
@@ -61,8 +61,11 @@
   }
   function paint(){
     const a=state?.autonomy||{},connected=socket.connected,active=connected&&!!a.active;
-    const calibrated=connected&&calibration?.calibrated===true&&!state?.calibration_error;
-    const map=age('map_age')<10,scan=age('scan_age')<.5,odom=age('odom_age')<1,imu=age('imu_age')<.75;
+    // Supervised speed limits remain; every patrol requires fresh detection.
+    const trial=state?.drive_mode==='supervised_trial';
+    const calibrated=connected&&(trial||(calibration?.calibrated===true&&!state?.calibration_error));
+    // 2026-10-25: 静态地图 latched 只发一次；map_loaded（map_server active + 已选地图）才可靠。
+    const map=connected&&(!!state?.map_loaded||age('map_age')<10),scan=age('scan_age')<.5,odom=age('odom_age')<1,imu=age('imu_age')<.75;
     const pose=connected&&!!state?.localized,planner=connected&&!!state?.navigator_ready;
     const camera=connected&&!!a.camera_ready,owner=connected&&armed&&mySid!==null&&driverSid===mySid;
     const checks=[['底盘实测标定',calibrated,calibrated?'配置已校验':'缺少速度、转角或实车确认'],
@@ -70,6 +73,7 @@
       ['地图与定位',map&&pose,map&&pose?'已就绪':'需准备建图或加载地图定位'],
       ['规划与避障服务',planner,planner?'已就绪':'尚未准备'],
       ['相机火情检测',camera,camera?'检测链路在线':'等待有效检测'],
+      ['巡检记录',!a.inspection_error,a.inspection_error||'可保存点位证据'],
       ['当前页面驾驶权',owner,owner?'当前页面持有':'启动前需手动启用电机']];
     const list=el('mission-checks');list.replaceChildren();
     for(const [name,ok,note]of checks){const li=document.createElement('li'),dot=document.createElement('i'),text=document.createElement('span'),small=document.createElement('small');dot.className=ok?'live':'';text.textContent=name;small.textContent=connected?note:'连接已断开';li.append(dot,text,small);list.append(li);}
@@ -85,7 +89,7 @@
     if(active)for(const id of ['patrol-add','patrol-save','patrol-load','patrol-new','patrol-preview'])el(id).disabled=true;
     el('mission-run-note').textContent=active?'执行时保持本页可见；切换页面、断线或失去驾驶权会停止任务，不会自行恢复。'
       :!calibrated?'自动行驶保持锁定。现在可以准备地图、配置点位和查看路径预览；实测标定完成后再启用。':'现场有人监督，确认路线与当前位置后，再由当前页面启用电机并启动。';
-    const stages={idle:'等待任务',stopped:'已停止',interrupted:'任务已中断',exploring:'选择探索目标',navigating:'前往目标',dwell:'到点等待',detecting:'正在检测',reporting:'正在生成报告',saving:'正在保存地图',completed:'任务已完成',blocked:'任务受阻',alert:'等待人工复核'};
+    const stages={idle:'等待任务',cancelled:'已取消',failed:'任务失败',stopped:'已停止',interrupted:'任务已中断',exploring:'选择探索目标',navigating:'前往目标',dwell:'到点等待',detecting:'正在检测',reporting:'正在生成报告',saving:'正在保存地图',completed:'任务已完成',blocked:'任务受阻',alert:'等待人工复核'};
     el('mission-stage').textContent=connected?(stages[a.status]||'等待任务状态'):'连接中断';
     el('mission-progress').textContent=String(a.completed_points||0);
     preview=a.preview||null;

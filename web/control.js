@@ -12,14 +12,16 @@
   let wanted = true, subscribed = false, pageActive = true;
   let frameAt = null, cameraError = '', decoded = 0, fps = null, fpsAt = performance.now();
   let frameAck = null, latency = null, clockOffset = null, bestRtt = Infinity, capturedAt = null;
+  let frameUrl = null;
   const image = el('ctl-video');
-  const available = () => wanted && pageActive && !document.hidden && socket.connected;
+  const available = () => wanted && pageActive && !document.hidden && socket.connected && cameraSocket.connected;
   function clearFrame() {
     if (frameAck) { const ack = frameAck; frameAck = null; ack(); }
     latency = null; capturedAt = null;
     frameAt = null; fps = null; decoded = 0; fpsAt = performance.now();
     image.hidden = true;
     image.removeAttribute('src');
+    if (frameUrl) { URL.revokeObjectURL(frameUrl); frameUrl = null; }
     el('ctl-video-format').textContent = '—';
   }
   function paint() {
@@ -27,7 +29,7 @@
     image.hidden = !live;
     el('ctl-video-placeholder').hidden = live;
     el('ctl-camera-dot').classList.toggle('live', live);
-    el('ctl-camera-state').textContent = live ? '实时' : !socket.connected ? '未连接' : !available() ? '已暂停' : '等待画面';
+    el('ctl-camera-state').textContent = live ? '实时' : !socket.connected || !cameraSocket.connected ? '未连接' : !available() ? '已暂停' : '等待画面';
     el('ctl-video-message').textContent = !socket.connected ? '连接已断开，等待重连'
       : !available() ? '摄像头画面已暂停' : cameraError || (frameAt === null ? '正在连接摄像头…' : '画面已中断，正在重试…');
     el('ctl-video-help').textContent = !wanted ? '点击「恢复画面」继续查看。' : '驾驶与云台独立控制，松开摇杆即停止。';
@@ -46,7 +48,7 @@
   function sync() {
     const next = available();
     if (next !== subscribed) {
-      if (socket.connected) socket.emit('camera_control', {action:next ? 'start' : 'stop', flow_control:true});
+      if (cameraSocket.connected) cameraSocket.emit('camera_control', {action:next ? 'start' : 'stop', flow_control:true, flow_window:2, binary:true});
       subscribed = next;
       clearFrame();
     }
@@ -67,31 +69,37 @@
     if (!available()) return;
     clearFrame(); cameraError = '画面加载失败，正在重试…'; paint();
   });
-  socket.on('frame', (data, ack) => {
-    if (!available() || typeof data?.img !== 'string' || !data.img) { if (typeof ack === 'function') ack(); return; }
+  cameraSocket.on('frame', (data, ack) => {
+    const binary = data?.jpeg instanceof ArrayBuffer || ArrayBuffer.isView(data?.jpeg) || data?.jpeg instanceof Blob;
+    if (!available() || (!binary && (typeof data?.img !== 'string' || !data.img))) { if (typeof ack === 'function') ack(); return; }
     if (frameAck) frameAck();
     frameAck = typeof ack === 'function' ? ack : null;
     capturedAt = typeof data.captured_at === 'number' && Number.isFinite(data.captured_at) ? data.captured_at : null;
-    image.src = 'data:image/jpeg;base64,'+data.img;
+    const previousUrl = frameUrl;
+    frameUrl = binary ? URL.createObjectURL(new Blob([data.jpeg], {type:'image/jpeg'})) : null;
+    image.src = frameUrl || 'data:image/jpeg;base64,'+data.img;
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
   });
-  socket.on('camera_state', state => {
+  cameraSocket.on('camera_state', state => {
     if (!available()) return;
     if (state?.error) { clearFrame(); cameraError = '摄像头暂不可用，正在重试…'; }
     paint();
   });
   function syncClock() {
-    if (!pageActive || document.hidden || !socket.connected) return;
+    if (!available()) return;
     const start = performance.now(), wall = Date.now();
-    socket.emit('camera_sync', serverTime => {
+    cameraSocket.emit('camera_sync', serverTime => {
       const rtt = performance.now()-start;
-      if (!pageActive || document.hidden || !socket.connected || typeof serverTime !== 'number' || !Number.isFinite(serverTime)) return;
+      if (!available() || typeof serverTime !== 'number' || !Number.isFinite(serverTime)) return;
       if (rtt < bestRtt) {
         bestRtt = rtt; clockOffset = serverTime*1000-wall-rtt/2;
       }
     });
   }
-  socket.on('connect', () => { subscribed = false; bestRtt = Infinity; clockOffset = null; sync(); syncClock(); });
-  socket.on('disconnect', () => { subscribed = false; clockOffset = null; clearFrame(); paint(); });
+  cameraSocket.on('connect', () => { subscribed = false; bestRtt = Infinity; clockOffset = null; sync(); syncClock(); });
+  cameraSocket.on('disconnect', () => { subscribed = false; clockOffset = null; clearFrame(); paint(); });
+  socket.on('connect', sync);
+  socket.on('disconnect', sync);
   document.addEventListener('visibilitychange', sync);
   window.addEventListener('pagehide', () => { pageActive = false; sync(); });
   window.addEventListener('pageshow', () => { pageActive = true; sync(); });

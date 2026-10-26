@@ -2,6 +2,8 @@
 # Localization and planning are available without a motion calibration.
 calibrated: false
 wheelbase_m: 0.300
+# 实车最小转弯半径（卷尺量/原地打满画圆）。0 = 按舵角理论推算。
+planning_turning_radius_m: 0.8
 # Operator tape measurements 2026-10-24, including protruding equipment.
 base_reference: rear_axle_midpoint
 front_extent_m: 0.400

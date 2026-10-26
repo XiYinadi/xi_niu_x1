@@ -60,7 +60,11 @@
       +(r.image?'<a href="/inspection/evidence/'+s.id+'/'+r.image+'" target="_blank" rel="noopener"><img loading="lazy" src="/inspection/evidence/'+s.id+'/'+r.image+'" alt="'+escape(r.label)+'的检测证据"></a>':'')
       +'<div class="evidence-body"><h3>'+escape(r.label)+'<span class="verdict-'+escape(r.verdict||'uncertain')+'">'+escape(r.status==='ok'?verdicts[r.verdict]:r.status==='skipped'?'未检测 · 已跳过':'检测失败')+'</span></h3>'
       +'<p>'+escape(r.reason||r.error||'')+'</p><small>'+time(r.captured_at||r.requested_at)+(r.status==='ok'?' · 判断置信度 '+Math.round(r.confidence*100)+'%':'')+'</small></div></article>').join(''):'<div class="empty-state">尚未产生检测记录。到达点位后点击检测，图片和结果将成对保存。</div>';
-    $('history-list').innerHTML=(state.history||[]).length?state.history.map(h=>'<div class="history-row"><div><strong>'+escape(h.title)+'</strong><small>'+time(h.started_at)+' · 有效检测 '+h.stats.checked+' / '+h.stats.planned+' · 疑似异常 '+h.stats.suspected+'</small></div>'
+    const _hist=(state.history||[]).length;
+    const _head=document.querySelector('#history .section-heading span:last-child');
+    if(_head)_head.textContent=_hist?(_hist+' 份报告 · 原始记录与模型说明可追溯'):'原始记录与模型说明可追溯';
+    $('history-list').innerHTML=(state.history||[]).length?state.history.map(h=>'<div class="history-row"><div><strong>'+escape(h.title)+'</strong><small>'+time(h.started_at)+' · 有效检测 '+h.stats.checked+' / '+h.stats.planned+' · 疑似异常 '+h.stats.suspected
++' · 未检测 '+h.stats.missing+'</small></div>'
       +(h.status==='completed'?'<a href="/inspection/reports/'+h.id+'" target="_blank" rel="noopener">'+(h.report_status==='ready'?'查看报告':'查看原始记录')+' ↗</a>':'<small>'+escape(names[h.status]||h.status)+'</small>')+'</div>').join(''):'<div class="empty-state">完成首次巡检后，报告会出现在这里。</div>';
   }
   async function refresh() { state=await api('/api/inspection/state');render(); }

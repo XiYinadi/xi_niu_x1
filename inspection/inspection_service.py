@@ -124,7 +124,17 @@ class InspectionService:
             try:
                 s=json.loads(path.read_text())
                 self.check_id(s['id'])
-                if s['status'] in ('sampling','reporting'):
+                if s.get('mode') == 'automatic' and s['status'] in ('running','sampling','reporting'):
+                    pending = s.pop('pending_record', None)
+                    if pending:
+                        pending.update(status='error', error='服务重启中断检测，未计为完成')
+                        s['records'].append(pending)
+                    s.pop('sample_token', None)
+                    s.update(status='completed', mission_status='interrupted', ended_at=s.get('ended_at') or timestamp(),
+                             report_status='interrupted', message='服务重启中断自动巡检；不会自动续跑，已保留原始记录')
+                    s['stats'] = statistics(s)
+                    atomic_json(path, s)
+                elif s['status'] in ('sampling','reporting'):
                     s.update(status='running' if s['status']=='sampling' else 'completed',
                              report_status='interrupted',message='服务重启中断了操作，请重试；未补造检测结果')
                     atomic_json(path,s)
@@ -178,20 +188,25 @@ class InspectionService:
                 report_status=s.get('report_status'),stats=s.get('stats') or statistics(s)) for s in reversed(list(self.sessions.values()))][:30]
             return dict(current=current,history=history,tasks=self.task_list(),model=self.model_status)
 
-    def start(self,data,mode='manual'):
+    def start(self,data,mode='manual',task_snapshot=None):
         if not isinstance(data,dict):raise ValueError('巡检请求格式无效')
         with self.lock:
-            if any(s['status'] in ('running','sampling','reporting') for s in self.sessions.values()):
+            if any(s['status'] in ('running','sampling','reporting','storage_error') for s in self.sessions.values()):
                 raise ValueError('已有巡检正在进行，请先结束当前巡检')
             title=str(data.get('title') or '人工火情巡检').strip()[:80]
             if data.get('task') and self.task_get is None:raise ValueError('任务模块尚未就绪')
             task=self.task_get(data['task']) if data.get('task') and self.task_get else None
+            if task_snapshot is not None:
+                task=copy.deepcopy(task_snapshot)
             sid=uuid.uuid4().hex
             s=dict(id=sid,title=title,mode=mode,task=copy.deepcopy(task),status='running',
                 started_at=timestamp(),ended_at=None,records=[],next_step=0,
                 planned_steps=len(task['waypoints'])*task['cycles'] if task else None,
                 report_status='pending',message='请到达巡检点后点击检测；本页不会驱动车轮')
-            self.directory(sid).mkdir();self.sessions[sid]=s;self.current=sid;self.persist(s)
+            if mode == 'automatic':
+                s['message']='按保存路线逐点到达、停稳后检测'
+            self.directory(sid).mkdir();self.persist(s)
+            self.sessions[sid]=s;self.current=sid
             return copy.deepcopy(s)
 
     def attach_alert(self,sid,alert):
@@ -204,7 +219,27 @@ class InspectionService:
             s['alert_revision']=s.get('alert_revision',0)+1
             self.persist(s)
 
-    def record(self,sid,skip=False,automatic=False):
+    def progress(self, sid):
+        with self.lock:
+            s=self.get(sid)
+            return dict(status=s['status'], next_step=s['next_step'], report_status=s.get('report_status'),
+                        record=copy.deepcopy(s['records'][-1]) if s['records'] else None)
+
+    def close_automatic(self, sid, reason, outcome):
+        with self.lock:
+            s=self.get(sid)
+            if s['mode'] != 'automatic':raise ValueError('只能关闭自动巡检记录')
+            if s['status'] in ('completed','reporting'):return
+            pending=s.pop('pending_record',None)
+            if pending:
+                pending.update(status='error',error='检测中断：'+reason)
+                s['records'].append(pending)
+            s.pop('sample_token',None)
+            s.update(status='running',mission_status=outcome,mission_message=reason)
+            self.persist(s)
+            self.finish(sid)
+
+    def record(self,sid,skip=False,automatic=False,context=None):
         with self.lock:
             s=self.get(sid)
             if s['mode']=='automatic' and not automatic:raise ValueError('自动巡检的检测由到达事件触发；请在驾驶页停止任务')
@@ -221,6 +256,8 @@ class InspectionService:
                 self.persist(s)
                 if task and s['next_step']==s['planned_steps']:self.finish(sid)
                 return
+            if automatic and context:record['arrival']=copy.deepcopy(context)
+            s['sample_token']=record['id'];s['pending_record']=copy.deepcopy(record)
             s['status']='sampling';s['message']='正在等待本地模型完成到点后的新一帧检测…';self.persist(s)
             after=time.time()
         def worker():
@@ -236,7 +273,6 @@ class InspectionService:
                 image=base64.b64decode(result['jpeg'],validate=True)
                 if not image.startswith(b'\xff\xd8') or not image.endswith(b'\xff\xd9'):raise ValueError('检测证据图片无效')
                 image_name=record['id']+'.jpg'
-                self.directory(sid).joinpath(image_name).write_bytes(image)
                 verdict=classify(result)
                 record.update(status='ok',verdict=verdict,fire=result['fire'],confidence=confidence,
                     conf_thresh=result.get('conf_thresh',.5),
@@ -246,12 +282,29 @@ class InspectionService:
             except Exception as e:
                 record.update(status='error',error=str(e))
             with self.lock:
-                s['records'].append(record);s['status']='running'
-                s['message']='检测完成，疑似异常请人工复核' if record['status']=='ok' else '检测失败：'+record['error']
-                if record['status']=='ok':s['next_step']+=1
-                self.persist(s)
-                if task and s['next_step']==s['planned_steps']:self.finish(sid)
+                # Cancellation/restart owns the session from this point onwards.
+                if s.get('sample_token')!=record['id'] or s['status']!='sampling':return
+                try:
+                    if record['status']=='ok':
+                        destination=self.directory(sid)/image_name
+                        pending=destination.with_suffix('.pending')
+                        with open(pending,'wb') as f:
+                            f.write(image);f.flush();os.fsync(f.fileno())
+                        os.replace(pending,destination)
+                    updated=copy.deepcopy(s)
+                    updated.pop('sample_token',None);updated.pop('pending_record',None)
+                    updated['records'].append(record);updated['status']='running'
+                    updated['message']='检测完成，疑似异常请人工复核' if record['status']=='ok' else '检测失败：'+record['error']
+                    if record['status']=='ok':updated['next_step']+=1
+                    # Publish progress only after both image and JSON are durable.
+                    self.persist(updated)
+                    s.clear();s.update(updated)
+                except Exception as exc:
+                    s['status']='storage_error';s['message']='记录保存失败：'+str(exc)
+                    return
+                if task and s['next_step']==s['planned_steps'] and not automatic:self.finish(sid)
         threading.Thread(target=worker,daemon=True).start()
+        return record['id']
 
     def finish(self,sid,retry=False):
         with self.lock:
@@ -324,7 +377,24 @@ def register_inspection(app, service, webroot):
         with service.lock:
             s=copy.deepcopy(service.get(sid));s['stats']=statistics(s)
         if s['status']!='completed':raise ValueError('请先结束巡检并等待报告生成')
-        return render_template_string((webroot/'inspection_report.html').read_text(),s=s)
+        # 2026-10-26: 报告页把「计划点位」和「实际记录」对齐展示，未检测的点也列出来。
+        task=s.get('task') or {}
+        waypoints=task.get('waypoints') or []
+        by_step={r.get('step'):r for r in s.get('records',[])}
+        points=[]
+        for i,wp in enumerate(waypoints):
+            points.append(dict(index=i+1,planned=wp,record=by_step.get(i)))
+        for step,rec in sorted(by_step.items(),key=lambda kv:(kv[0] is None, kv[0] or 0)):
+            if not isinstance(step,int) or step>=len(waypoints):
+                points.append(dict(index=(step+1) if isinstance(step,int) else len(points)+1,
+                                   planned=None,record=rec))
+        duration=None
+        try:
+            duration=int((datetime.datetime.fromisoformat(s['ended_at'])-datetime.datetime.fromisoformat(s['started_at'])).total_seconds())
+        except (KeyError,TypeError,ValueError):
+            duration=None
+        return render_template_string((webroot/'inspection_report.html').read_text(),
+                                      s=s,points=points,duration=duration)
     @bp.get('/inspection/reports/<sid>/data')
     def download(sid):
         service.get(sid);service.check_id(sid)

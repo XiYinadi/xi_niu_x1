@@ -48,6 +48,12 @@ from PIL import Image
 # ── Flask + SocketIO ──────────────────────────────────────────────
 from flask import Flask, redirect, render_template_string, request, send_file
 from flask_socketio import SocketIO, join_room, leave_room
+from werkzeug.serving import WSGIRequestHandler
+
+
+class RealtimeRequestHandler(WSGIRequestHandler):
+    # Send frame/command ACKs promptly on both WebSocket and polling sockets.
+    disable_nagle_algorithm = True
 
 # ── ROS2 ───────────────────────────────────────────────────────────
 import rclpy
@@ -601,7 +607,8 @@ def autonomy_script():
 
 
 def _automatic_active():
-    return getattr(getattr(_navigation,'autonomy',None),'active',False) is True
+    return any(getattr(getattr(_navigation,name,None),'active',False) is True
+               for name in ('autonomy','patrol_runner'))
 
 
 @socketio.on('navigation_control')
@@ -837,7 +844,9 @@ def broadcast_loop():
 _cam_enabled = threading.Event()  # set while ≥1 client wants the stream
 _cam_lock = threading.Lock()
 _cam_clients = set()  # sids that requested the stream
-_cam_flow = {}  # opt-in clients: None=ready, token=one frame awaiting decode ACK
+_cam_flow = {}  # sid -> outstanding frame tokens, bounded per connection
+_cam_limits = {}  # legacy flow clients:1; dedicated video connection:at most2
+_cam_binary = set()  # opted-in bounded previews; legacy pages keep base64 JPEG
 _cam_status = {"running": False, "w": 0, "h": 0, "fps": 0.0, "error": None}
 CAMERA_ROOM = "camera_preview"
 
@@ -848,25 +857,43 @@ def _cam_publish_state():
     socketio.emit("camera_state", state)
 
 
-def _cam_publish_frame(image, width, height, sequence=None, captured_at=None):
+def _cam_preview(jpeg):
+    # Forward the original JPEG: preserve its resolution and image quality.
+    with Image.open(io.BytesIO(jpeg)) as picture:
+        return jpeg, picture.width, picture.height
+
+
+def _cam_publish_frame(image, width, height, sequence=None, captured_at=None, jpeg=None):
     payload = {"img": image, "w": width, "h": height,
                "sequence": sequence, "captured_at": captured_at}
-    # Old clients retain the room contract. Updated pages allow at most one
+    # Old clients retain the room contract. Updated pages allow at most two
     # in-flight frame each; slow decoding/network skips frames rather than queues.
     socketio.emit("frame", payload, to=CAMERA_ROOM)
     ready = []
     with _cam_lock:
         for sid, pending in _cam_flow.items():
-            if pending is None:
+            if len(pending) < _cam_limits.get(sid, 1):
                 token = object()
-                _cam_flow[sid] = token
-                ready.append((sid, token))
-    for sid, token in ready:
-        def decoded(*args, sid=sid, token=token):
+                pending[token] = True
+                ready.append((sid, token, pending, sid in _cam_binary))
+    binary_payload = None
+    if jpeg is not None and any(item[3] for item in ready):
+        try:
+            preview, preview_w, preview_h = _cam_preview(jpeg)
+        except Exception:
+            # Preserve delivery/ACKs if preview conversion fails. Otherwise the
+            # reserved tokens fill up and this subscriber cannot recover.
+            log.exception('Preview conversion failed; forwarding original JPEG')
+            preview, preview_w, preview_h = jpeg, width, height
+        binary_payload = {**payload, 'jpeg': preview, 'w': preview_w, 'h': preview_h}
+        binary_payload.pop('img')
+    for sid, token, pending, binary in ready:
+        def decoded(*args, sid=sid, token=token, pending=pending):
             with _cam_lock:
-                if _cam_flow.get(sid) is token:
-                    _cam_flow[sid] = None
-        socketio.emit("frame", payload, to=sid, callback=decoded)
+                if _cam_flow.get(sid) is pending:
+                    pending.pop(token, None)
+        socketio.emit("frame", binary_payload if binary and binary_payload else payload,
+                      to=sid, callback=decoded)
 
 
 def camera_loop():
@@ -904,7 +931,7 @@ def camera_loop():
             last_sequence = sequence
 
             b64 = base64.b64encode(jpg).decode("ascii")
-            _cam_publish_frame(b64, w, h, sequence, captured_at)
+            _cam_publish_frame(b64, w, h, sequence, captured_at, jpg)
 
             if not _cam_status.get("running"):
                 _cam_status.update(running=True, error=None)
@@ -1162,7 +1189,9 @@ def _send_gimbal(dx, dy):
 @socketio.on("disconnect")
 def _on_disconnect():
     global _motor_armed, _drive_owner, _gimbal_owner
-    navigation_owned = _navigation is not None and request.sid == _navigation.nav_owner
+    patrol = getattr(_navigation, 'patrol_runner', None)
+    navigation_owned = _navigation is not None and (request.sid == _navigation.nav_owner
+        or (patrol is not None and patrol.active and request.sid == patrol.sid))
     # Disconnect must stop hardware before acquiring navigation locks/RPCs.
     # An observer disconnect must leave the actual driver's task untouched.
     if _motor_armed and request.sid == _drive_owner:
@@ -1181,6 +1210,8 @@ def _on_disconnect():
     with _cam_lock:
         _cam_clients.discard(request.sid)
         _cam_flow.pop(request.sid, None)
+        _cam_limits.pop(request.sid, None)
+        _cam_binary.discard(request.sid)
         if not _cam_clients:
             _cam_enabled.clear()
             log.info("All clients left — camera stream OFF")
@@ -1218,9 +1249,16 @@ def _on_camera_control(data):
         with _cam_lock:
             _cam_clients.add(request.sid)
             if flow:
-                _cam_flow.setdefault(request.sid, None)
+                _cam_flow.setdefault(request.sid, {})
+                _cam_limits[request.sid] = 2 if data.get('flow_window') == 2 else 1
+                if data.get('binary') is True:
+                    _cam_binary.add(request.sid)
+                else:
+                    _cam_binary.discard(request.sid)
             else:
                 _cam_flow.pop(request.sid, None)
+                _cam_limits.pop(request.sid, None)
+                _cam_binary.discard(request.sid)
             _cam_enabled.set()
             _cam_status.update(error=None)
         log.info("Camera stream ON (sid=%s)", request.sid)
@@ -1229,6 +1267,8 @@ def _on_camera_control(data):
         with _cam_lock:
             _cam_clients.discard(request.sid)
             _cam_flow.pop(request.sid, None)
+            _cam_limits.pop(request.sid, None)
+            _cam_binary.discard(request.sid)
             if not _cam_clients:
                 _cam_enabled.clear()
                 log.info("Camera stream OFF (sid=%s)", request.sid)
@@ -1320,6 +1360,8 @@ def _on_motor_control(data):
         if _navigation is not None and (_navigation.navigating or _automatic_active()):
             if abs(lin) < 0.001 and abs(ang) < 0.001 and not data.get('takeover'):
                 return  # Idle manual heartbeats must not overwrite autonomous commands.
+            log.warning('Manual takeover: sid=%s owner=%s lin=%.3f ang=%.3f takeover=%s',
+                        request.sid, _drive_owner, lin, ang, bool(data.get('takeover')))
             _navigation.cancel('手动接管，导航已取消')
         # A loopback ROS bridge has already consumed /cmd_vel. Mirroring its
         # normalized output back to that topic would create a feedback loop.
@@ -1655,6 +1697,8 @@ def main():
         task_list=lambda: _navigation.patrols.list() if _navigation is not None else [],
         task_get=inspection_task, pose=inspection_pose)
     register_inspection(app, inspection, Path.home()/'robot'/'web')
+    if _navigation is not None:
+        _navigation.patrol_runner.inspections = inspection
     threading.Thread(target=inspection.health_loop, daemon=True).start()
     if _navigation is not None:
         from autonomy_runtime import AutonomyRuntime, register_autonomy
@@ -1686,7 +1730,7 @@ def main():
     log.info("Open http://<LAN-IP>:%d in your browser", PORT)
 
     try:
-        socketio.run(app, host="0.0.0.0", port=PORT)
+        socketio.run(app, host="0.0.0.0", port=PORT, request_handler=RealtimeRequestHandler)
     finally:
         log.info("Cleaning up...")
         try:
@@ -2293,6 +2337,9 @@ resize();
 
 // ── SocketIO ────────────────────────────────────────────────────
 const socket = io({query:{view:controlPage ? 'control' : mappingPage || missionPage ? 'mapping' : 'console'}});
+// Video must not fill the driver's Engine.IO polling queue. Camera disconnects
+// never release driving ownership: they belong to a separate, non-driver SID.
+const cameraSocket = controlPage ? io({forceNew:true,query:{view:'camera'}}) : socket;
 const connDot = document.getElementById('conn-dot');
 const connText = document.getElementById('conn-text');
 
@@ -2474,7 +2521,7 @@ let driverSid = null;    // 当前驾驶者的 sid; null = 还没人被授权
 // (_gimbal_owner / _drive_owner)。复用一个就会把云台重新绑回 armed 门上。
 let gimbalOwner = null;
 let driveClock = null; // Conservative server-monotonic anchor at ACK receipt.
-let driveClockEpoch = 0, driveSyncPending = 0, driveSyncSerial = 0;
+let driveClockEpoch = 0, driveSyncPending = 0, driveSyncSerial = 0, driveClockSamples = [];
 function syncDriveClock() {
   if (!controlPage || !socket.connected || document.hidden || driveSyncPending) return;
   const start = performance.now(), epoch = driveClockEpoch, token = ++driveSyncSerial;
@@ -2485,12 +2532,16 @@ function syncDriveClock() {
     const received = performance.now(), rtt = received-start;
     if (!socket.connected || document.hidden || typeof serverTime !== 'number' || !Number.isFinite(serverTime) || rtt < 0 || rtt > 150) return;
     // Do not add half the RTT: the estimate must never date a command in the future.
-    driveClock = {server:serverTime, local:received};
+    driveClockSamples.push({server:serverTime,local:received,rtt});
+    driveClockSamples=driveClockSamples.filter(sample=>received-sample.local<=16000);
+    // Keep the least delayed recent sample, rather than replacing a good clock
+    // anchor with one delayed by a busy transport or image decode.
+    driveClock=driveClockSamples.reduce((best,sample)=>sample.rtt<best.rtt?sample:best);
   });
   setTimeout(() => { if (driveSyncPending === token) driveSyncPending = 0; }, 1000);
 }
-socket.on('connect', () => { driveClockEpoch++; driveClock=null; driveSyncPending=0; syncDriveClock(); });
-socket.on('disconnect', () => { driveClockEpoch++; driveClock=null; driveSyncPending=0; });
+socket.on('connect', () => { driveClockEpoch++; driveClock=null; driveClockSamples=[]; driveSyncPending=0; syncDriveClock(); });
+socket.on('disconnect', () => { driveClockEpoch++; driveClock=null; driveClockSamples=[]; driveSyncPending=0; });
 if (controlPage) setInterval(syncDriveClock, 2000);
 const btnArm = document.getElementById('btn-arm');
 const btnEstop = document.getElementById('btn-estop');
@@ -2580,7 +2631,7 @@ function sendDriveTarget(linear, angular, takeover=false, periodic=false) {
     }
     // All periodic state (including neutral) is replaceable. Explicit release/stop
     // remains reliable and untimestamped: an old zero can never authorize motion.
-    if ((periodic || moving) && socket.volatile) {
+    if (periodic && socket.volatile) {
       socket.volatile.emit('motor_control', payload);
       return;
     }
@@ -2764,11 +2815,18 @@ document.addEventListener('keydown', e => {
   if (e.repeat) return;
   keys[e.key] = true;
 });
+function sendReleasedDrive() {
+  if (missionPage || !armed || !isDriver()) return;
+  const target = driveTarget();
+  sendDriveTarget(target.l, target.a);
+}
 document.addEventListener('keyup', e => {
+  const wasPressed = keys[e.key] || (e.key.length === 1 && (keys[e.key.toLowerCase()] || keys[e.key.toUpperCase()]));
   keys[e.key] = false;
   // 2026-10-25: Shift 按住时 e.key 是大写，先松 Shift 再松 W 会留下 keys['W']=true
   // 卡在云台上；两个都清。
   if (e.key.length === 1) { keys[e.key.toLowerCase()] = false; keys[e.key.toUpperCase()] = false; }
+  if (wasPressed && e.key !== 'Shift') sendReleasedDrive();
 });
 
 // 虚拟摇杆: 上=前进 下=后退,左=左转 右=右转。
@@ -2829,8 +2887,12 @@ for (const p of padList) {
       padUpdate(p, e.clientX, e.clientY);
     }
   });
-  p.el.addEventListener('pointerup', () => { p.active = false; p.pid = null; padReset(p); });
-  p.el.addEventListener('pointercancel', () => { p.active = false; p.pid = null; padReset(p); });
+  const release = () => {
+    p.active = false;p.pid = null;padReset(p);
+    if (!p.isGimbal) sendReleasedDrive();
+  };
+  p.el.addEventListener('pointerup', release);
+  p.el.addEventListener('pointercancel', release);
 }
 
 // 失焦 / 切标签页时 keyup 与 pointerup 都不会触发,按键和摇杆状态会残留 →
@@ -3346,9 +3408,9 @@ requestAnimationFrame(render);
 </script>
 <script src="/navigation.js?v=20261021-missions1"></script>
 <script src="/mapping.js?v=20261023-odom1"></script>
-<script src="/control.js?v=20261021-drive3"></script>
-<script src="/autonomy.js"></script>
-<script src="/missions.js?v=20261023-navigation1"></script>
+<script src="/control.js?v=20261026-video4"></script>
+<script src="/autonomy.js?v=20261026-inspection1"></script>
+<script src="/missions.js?v=20261026-inspection1"></script>
 <script src="/navigation_page.js?v=20261023-navigation1"></script>
 </body>
 </html>"""

@@ -1,8 +1,102 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{s.title}} · 巡检报告</title><style>
-*{box-sizing:border-box}body{font:14px/1.8 'Segoe UI','Microsoft YaHei',sans-serif;color:#26303b;background:#edf0f3;margin:0}.toolbar{max-width:960px;margin:24px auto;display:flex;gap:16px;align-items:center}.toolbar button,.toolbar a{font:inherit;padding:8px 14px;background:white;border:1px solid #c7ced7;border-radius:5px;text-decoration:none;color:inherit;cursor:pointer}.report{background:#fff;max-width:960px;margin:0 auto 40px;padding:55px 65px}h1{font-size:29px;font-weight:600;margin:14px 0}h2{font-size:17px;margin-top:30px}p{white-space:pre-wrap}.kicker{letter-spacing:2px;font-size:10px;color:#7b8490}.meta{color:#6b7480;font-size:12px}.outcome{border:1px solid #d9dee5;border-left:4px solid #bd8037;padding:16px 20px;margin:26px 0}.stats{display:flex;gap:35px;font-size:12px}.stats strong{display:block;font-size:25px}.record{break-inside:avoid;border-top:1px solid #d9dee5;padding:20px 0;display:flex;gap:20px}.record img{width:220px;height:165px;object-fit:contain;background:#f0f2f5}.record div{flex:1}.record h3{font-size:14px;margin:0 0 8px}.record p{font-size:12px;margin:7px 0}.record small{font-size:10px;color:#68717e;word-break:break-all}.warning{color:#8b561f}.fineprint{font-size:11px;color:#68717e;border-top:1px solid #d9dee5;margin-top:30px;padding-top:20px}@media(max-width:650px){.report{padding:28px 20px}.toolbar{padding:0 15px;flex-wrap:wrap}.record{flex-direction:column}.stats{gap:20px;flex-wrap:wrap}.record img{width:100%;height:auto}}@media print{body{background:#fff}.toolbar{display:none}.report{max-width:none;margin:0;padding:0}@page{size:A4;margin:18mm}.record img{width:180px;height:135px}a{color:inherit;text-decoration:none}}</style></head><body>
-<nav class="toolbar"><a href="/inspection">返回巡检工作台</a><button onclick="window.print()">打印 / 保存为 PDF</button><a href="/inspection/reports/{{s.id}}/data">下载原始 JSON</a></nav>
-<article class="report"><div class="kicker">RHINO PI / INSPECTION RECORD</div><h1>{{s.title}}</h1><div class="meta">{{'自动' if s.mode=='automatic' else '人工'}}巡检报告 · 编号 {{s.id[:12]}}<br>开始：{{s.started_at}}<br>结束：{{s.ended_at}}<br>路线：{{s.task.name if s.task else '定点检测，未绑定路线'}}{% if s.task %} · 地图 {{s.task.map}}{% endif %}</div>
-<div class="outcome"><strong>{{s.stats.overall}}</strong><div class="stats"><div>计划点次<strong>{{s.stats.planned}}</strong></div><div>有效检测<strong>{{s.stats.checked}}</strong></div><div>疑似异常<strong>{{s.stats.suspected}}</strong></div><div>未检测<strong>{{s.stats.missing}}</strong></div><div>待复核<strong>{{s.stats.uncertain}}</strong></div></div></div>
-<h2>本地模型整理</h2>{% if s.report_status=='ready' and s.analysis %}<div class="meta">模型：{{s.analysis.model}} · 生成于 {{s.analysis.generated_at}}</div><p>{{s.analysis.summary}}</p>{% if s.analysis.review_note %}<p class="meta">{{s.analysis.review_note}}</p>{% endif %}{% if s.analysis.recommendations %}<h2>复核建议</h2><ul>{% for text in s.analysis.recommendations %}<li>{{text}}</li>{% endfor %}</ul>{% endif %}{% else %}<p class="warning">本地模型分析尚未生成：{{s.get('report_error','操作被服务重启中断')}}。下方为实际记录，不补写缺失结果。可返回工作台重试。</p>{% endif %}
-<h2>原始检测证据</h2>{% for a in s.get("alerts",[]) %}<section class="record"><div><h3 class="warning">异常停车告警 · {{a.created_at}}</h3><p>{{a.reason}} · 置信度 {{(a.confidence*100)|round(1)}}%</p>{% if a.image %}<img src="/inspection/evidence/{{s.id}}/{{a.image}}" alt="异常停车证据"><small>SHA-256：{{a.sha256}}</small>{% endif %}<p>实际位置：{{a.pose}}。已停止任务，等待人工复核。</p></div></section>{% endfor %}{% for r in s.records %}<section class="record">{% if r.image %}<img src="/inspection/evidence/{{s.id}}/{{r.image}}" alt="{{r.label}}的检测原始帧">{% endif %}<div><h3>{{r.label}} · {% if r.status=='ok' %}{{'疑似火情' if r.verdict=='suspected' else '待复核' if r.verdict=='uncertain' else '未见明显火焰或烟雾'}}{% elif r.status=='skipped' %}未检测，操作者跳过{% else %}检测失败{% endif %}</h3><p>到点操作时间：{{r.requested_at}}</p>{% if r.status=='ok' %}<p>采集时间戳：{{r.captured_at}} · 判断置信度：{{(r.confidence*100)|round(1)}}%<br>检测说明：{{r.reason}}<br>检测模型：{{r.model}}</p><small>图片 SHA-256：{{r.sha256}}</small>{% else %}<p>{{r.error}}</p>{% endif %}{% if r.planned_pose %}<p>计划位置：({{r.planned_pose.x}}, {{r.planned_pose.y}}) m，计划朝向 {{r.planned_pose.yaw}} rad。计划坐标不等于已验证到达。</p>{% endif %}{% if r.observed_pose %}<p>到点操作时定位记录：{{r.observed_pose}}</p>{% else %}<p>{% if s.mode=='automatic' %}未取得可靠的实际位置记录，缺少可核对的位置证据。{% else %}未取得可靠的实际位置记录；到达由操作者确认。{% endif %}</p>{% endif %}</div></section>{% else %}<p>本次未取得检测证据。</p>{% endfor %}
-<div class="fineprint">本报告依据到点事件、实际相机帧和板载本地模型输出生成。图片与对应检测结果成对存储；失败、跳过和未完成项不会计为正常。模型说明属于辅助判读，结论仅覆盖已采集画面，不代表未拍摄区域安全，不包含未经记录的自主移动、温度、气体或灭火结论。</div></article></body></html>
+:root{--ink:#1f2933;--dim:#6b7580;--line:#e2e7ec;--ok:#1f8a5a;--warn:#b26a00;--bad:#c0392b;--bg:#eef1f4}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.7 'Segoe UI','Microsoft YaHei',sans-serif}
+.toolbar{max-width:980px;margin:20px auto;display:flex;gap:12px;align-items:center;padding:0 14px}
+.toolbar a,.toolbar button{font:inherit;padding:8px 14px;background:#fff;border:1px solid #cbd2da;border-radius:6px;text-decoration:none;color:inherit;cursor:pointer}
+.toolbar a:hover,.toolbar button:hover{border-color:#9aa6b2}
+.report{max-width:980px;margin:0 auto 40px;background:#fff;padding:44px 56px;border-radius:8px;box-shadow:0 1px 3px #00000010}
+.kicker{font-size:10px;letter-spacing:2.4px;color:#8a939e}
+h1{font-size:26px;margin:8px 0 12px}
+.meta{color:var(--dim);font-size:12px;line-height:1.9}
+.meta b{color:var(--ink);font-weight:600}
+.pill{display:inline-block;padding:3px 12px;border-radius:999px;font-size:12px;font-weight:600;margin-top:10px}
+.pill.ok{background:#e5f4ec;color:var(--ok)}
+.pill.warn{background:#fdf1dd;color:var(--warn)}
+.pill.bad{background:#fbe9e7;color:var(--bad)}
+.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:22px 0}
+.card{border:1px solid var(--line);border-radius:8px;padding:12px 14px}
+.card span{font-size:11px;color:var(--dim)}
+.card strong{display:block;font-size:24px;margin-top:2px;font-weight:600}
+.banner{border-left:4px solid var(--warn);background:#fdf8ef;padding:10px 14px;margin:16px 0;font-size:13px}
+h2{font-size:15px;margin:26px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+.point{display:flex;gap:16px;padding:16px 0;border-bottom:1px dashed var(--line)}
+.thumb{width:180px;height:135px;flex:none;background:#f2f4f7;border-radius:6px;object-fit:cover}
+.body{flex:1;min-width:0}
+.point h3{font-size:14px;margin:0 0 6px}
+.point p{margin:3px 0;font-size:12px;color:#414c58}
+.tag{display:inline-block;font-size:11px;padding:1px 8px;border-radius:999px;margin-left:6px;vertical-align:1px;font-weight:500}
+.tag.clear{background:#e5f4ec;color:var(--ok)}
+.tag.suspected{background:#fbe9e7;color:var(--bad)}
+.tag.uncertain{background:#fdf1dd;color:var(--warn)}
+.tag.missing{background:#eceff3;color:#77808b}
+.small{font-size:11px;color:#7b8490;word-break:break-all}
+details{margin-top:6px}
+summary{cursor:pointer;color:var(--dim);font-size:12px}
+ul{margin:6px 0 0 18px;padding:0}
+.fineprint{margin-top:28px;padding-top:14px;border-top:1px solid var(--line);font-size:11px;color:#77808b;line-height:1.8}
+@media(max-width:720px){.report{padding:24px 18px;margin:0 10px 24px}.cards{grid-template-columns:repeat(2,1fr)}.point{flex-direction:column}.thumb{width:100%;height:auto}.toolbar{flex-wrap:wrap}}
+@media print{body{background:#fff}.toolbar{display:none}.report{box-shadow:none;max-width:none;margin:0;padding:0}@page{size:A4;margin:16mm}.point{break-inside:avoid}a{color:inherit;text-decoration:none}}
+</style></head><body>
+<nav class="toolbar"><a href="/inspection">← 返回巡检工作台</a><button onclick="window.print()">打印 / 导出 PDF</button><a href="/inspection/reports/{{s.id}}/data">下载原始 JSON</a></nav>
+<article class="report">
+<div class="kicker">RHINO ONE · INSPECTION RECORD</div>
+<h1>{{s.title}}</h1>
+<div class="meta">{{'自动' if s.mode=='automatic' else '人工'}}巡检 · 编号 <b>{{s.id[:12]}}</b>{% if s.task %} · 路线 <b>{{s.task.name}}</b> · 地图 <b>{{s.task.map}}</b>{% endif %}<br>开始 <b>{{s.started_at}}</b>　结束 <b>{{s.ended_at}}</b>{% if duration is not none %}　用时 <b>{{duration}} 秒</b>{% endif %}</div>
+{% set overall = s.stats.overall %}
+<span class="pill {{ 'ok' if s.stats.suspected==0 and s.stats.missing==0 and s.stats.uncertain==0 else 'warn' if s.stats.suspected==0 else 'bad' }}">{{overall}}</span>
+<div class="cards">
+<div class="card"><span>计划点次</span><strong>{{s.stats.planned}}</strong></div>
+<div class="card"><span>有效检测</span><strong>{{s.stats.checked}}</strong></div>
+<div class="card"><span>疑似异常</span><strong>{{s.stats.suspected}}</strong></div>
+<div class="card"><span>未检测</span><strong>{{s.stats.missing}}</strong></div>
+<div class="card"><span>待复核</span><strong>{{s.stats.uncertain}}</strong></div>
+</div>
+{% if s.get('mission_message') %}<div class="banner"><b>任务结束原因：</b>{{s.mission_message}}</div>{% endif %}
+<h2>点位记录</h2>
+{% for p in points %}
+<section class="point">
+{% if p.record and p.record.image %}<img class="thumb" src="/inspection/evidence/{{s.id}}/{{p.record.image}}" alt="点位 {{p.index}} 检测证据">{% endif %}
+<div class="body">
+<h3>{% if p.record and p.record.label %}{{p.record.label}}{% else %}点位 {{p.index}}{% endif %}
+{% if p.record %}
+{% if p.record.status!='ok' %}<span class="tag missing">未完成</span>
+{% elif p.record.verdict=='suspected' %}<span class="tag suspected">疑似火情</span>
+{% elif p.record.verdict=='uncertain' %}<span class="tag uncertain">待复核</span>
+{% else %}<span class="tag clear">未见异常</span>{% endif %}
+{% else %}<span class="tag missing">未检测</span>{% endif %}
+</h3>
+{% if p.planned %}<p>计划位置：x {{'%.2f'|format(p.planned.x)}} m · y {{'%.2f'|format(p.planned.y)}} m · 朝向 {{'%.2f'|format(p.planned.yaw)}} rad</p>{% endif %}
+{% if p.record %}
+<p>到点时间：{{p.record.requested_at}}{% if p.record.confidence is not none %} · 判断置信度 {{(p.record.confidence*100)|round(1)}}%{% endif %}</p>
+{% if p.record.reason %}<p>检测说明：{{p.record.reason}}</p>{% endif %}
+{% if p.record.model %}<p class="small">模型：{{p.record.model}}</p>{% endif %}
+{% if p.record.sha256 %}<p class="small">图片 SHA-256：{{p.record.sha256}}</p>{% endif %}
+{% else %}
+<p class="small">该点位没有有效检测记录，不计为正常。</p>
+{% endif %}
+</div>
+</section>
+{% endfor %}
+{% if s.get('alerts') %}
+<h2>异常停车告警</h2>
+{% for a in s.get('alerts',[]) %}
+<section class="point">
+{% if a.image %}<img class="thumb" src="/inspection/evidence/{{s.id}}/{{a.image}}" alt="异常停车证据">{% endif %}
+<div class="body"><h3>异常停车告警 <span class="tag suspected">已停车</span></h3>
+<p>{{a.reason}} · 置信度 {{(a.confidence*100)|round(1)}}%</p>
+<p class="small">{{a.created_at}}</p></div>
+</section>
+{% endfor %}
+{% endif %}
+<h2>本地模型分析</h2>
+{% if s.report_status=='ready' and s.analysis %}
+<p class="small">模型：{{s.analysis.model}} · 生成于 {{s.analysis.generated_at}}</p>
+<p>{{s.analysis.summary}}</p>
+{% if s.analysis.review_note %}<p class="small">{{s.analysis.review_note}}</p>{% endif %}
+{% if s.analysis.recommendations %}<details open><summary>复核建议（{{s.analysis.recommendations|length}} 条）</summary><ul>{% for text in s.analysis.recommendations %}<li>{{text}}</li>{% endfor %}</ul></details>{% endif %}
+{% else %}
+<div class="banner">本地模型分析尚未生成：{{s.get('report_error','操作被服务重启中断')}}。下方为实际记录，不补写缺失结果。</div>
+{% endif %}
+<div class="fineprint">本报告依据到点事件、实际相机帧和板载本地模型输出生成。图片与检测结果成对存储；失败、跳过、未完成的点位不会计为正常。模型结论仅覆盖已采集画面，不代表未拍摄区域安全，不包含温度、气体或灭火结论。</div>
+</article></body></html>

@@ -20,6 +20,7 @@ from navigation_core import fresh, twist_to_joystick, validate_calibration
 from navigation_drive import is_trial, validate_navigation, TrialDrive, scan_clearance
 from patrol_store import PatrolStore, validate_task
 from patrol_preview import PatrolPreview
+from patrol_runner import PatrolRunner
 from localization_settle import StaticPoseSettle
 
 
@@ -50,6 +51,7 @@ class NavigationRuntime:
         self.trial_no_motion = None
         self.preview_cache = None
         self.lock = threading.RLock()
+        self.patrol_runner = PatrolRunner(self)
         self.mode = 'localization'
         self.autonomy = None
         self.busy = False
@@ -199,6 +201,8 @@ class NavigationRuntime:
             return dict(status=self.status, message=self.note, busy=self.busy,
                 running=self.running(), maps=self.store.list(), selected_map=self.active_map,
                 localized=ready,
+                # 2026-10-25: 静态地图是 latched 只发一次，不能拿 map_age 当就绪判据。
+                map_loaded=bool(self.active_map) and self.lifecycle.get('map_server') == 3,
                 localization=dict(pose_ok=bool(self.pose_ok),
                     amcl_age=(now-self.last_amcl) if self.last_amcl else None,
                     cov=self.pose_cov), calibration_error=self.calibration_error(),
@@ -209,7 +213,9 @@ class NavigationRuntime:
                 initial_pose_ready=all(self.lifecycle.get(k) == 3 for k in ('map_server','amcl')),
                 navigating=self.navigating, goal=self.goal, path=self.path,
                 mode=getattr(self,'mode','localization'),
-                autonomy=self.autonomy.snapshot() if getattr(self,'autonomy',None) else None,
+                autonomy=(self.autonomy.snapshot() if self.autonomy and
+                          (self.autonomy.active or self.mode == 'mapping')
+                          else self.patrol_runner.snapshot()),
                 pose=self.last_pose if ready else None,
                 patrols=self.patrols.list(), patrol_preview=self.route_preview.snapshot(),
                 planner_ready=self.planner.server_is_ready() and self.lifecycle.get('planner_server') == 3,
@@ -307,6 +313,9 @@ class NavigationRuntime:
 
     def cancel(self, reason='导航已取消', disarm=False, keep_route=False, keep_mission=False):
         with self.lock:
+            # 2026-10-25: 手动接管/急停/取消导航时，巡检执行器一起停。
+            if not keep_mission and getattr(self, 'patrol_runner', None):
+                self.patrol_runner.cancel(reason)
             had_motion = self.navigating
             self.epoch += 1  # invalidate in-flight goal acceptance/results
             self.navigating = False
@@ -415,6 +424,7 @@ class NavigationRuntime:
                 self.cancel('导航进程已退出，请查看运行日志', disarm=True)
                 self.process = None
                 self.status = 'error'
+            self.patrol_runner.tick()
             if getattr(self,'mode','localization')=='mapping' and self.status=='mapping' and self.localized(now) and all(self.lifecycle.get(k)==3 for k in ('planner_server','controller_server','bt_navigator','velocity_smoother')):
                 self.note='建图与避障服务已就绪；可预览探索目标，完成标定后开始自动建图'
             if not self.navigating:
@@ -445,10 +455,22 @@ class NavigationRuntime:
                 self.send_drive(0.0, 0.0, self.armed())
                 if is_trial(self.config):self.last_control_t=now
                 return
+            # 2026-10-26: 巡检用的是自己的 action client 和看门狗；运行时这套
+            # 单目标看门狗（心跳 0.6s / 指令超时）在 VLM 推理期间必然误判，
+            # 会把巡检在第 1 点检测完时掐掉。巡检 active 时让这里失效。
+            if getattr(self, 'patrol_runner', None) is not None and self.patrol_runner.active:
+                reason = None
             if reason:
                 self.cancel(reason, disarm=True)
                 return
             try:
+                # 2026-10-26: 巡检在 dwell/detecting/reporting 时车本来就该停着，
+                # 不做试航换算，直接发 0 —— 免得 VLM 推理的长停顿触发净空/节拍误判。
+                _patrol = getattr(self, 'patrol_runner', None)
+                if (_patrol is not None and _patrol.active
+                        and getattr(_patrol, 'status', '') != 'navigating'):
+                    self.send_drive(0.0, 0.0, self.armed())
+                    return
                 if is_trial(self.config):
                     with self.node._lock:odom=dict(self.node._odometry or {})
                     age=time.time()-odom['stamp'] if odom else None
@@ -631,6 +653,33 @@ class NavigationRuntime:
                 else:
                     raise
 
+    def patrol_leg_begin(self, sid):
+        # 巡检每段开始：把试航链路摆成「正在导航」的状态，否则 Nav2 的
+        # cmd_vel 会被 on_command 丢掉（它只在 navigating 为真时接收）。
+        with self.lock:
+            with self.node._lock:
+                odom = dict(self.node._odometry or {})
+            self.navigating = True
+            self.nav_owner = sid
+            self.last_client = time.monotonic()
+            self.last_command = None
+            self._command_grace_until = time.monotonic() + 3.0
+            self._command_stale_from = None
+            self.trial_origin = odom
+            self.trial_started = self.last_control_t = time.monotonic()
+            self.trial_no_motion = None
+            if getattr(self, 'trial_drive', None):
+                self.trial_drive.reset()
+
+    def patrol_leg_end(self):
+        with self.lock:
+            self.navigating = False
+            self.nav_owner = None
+            self.last_command = None
+            self.command = (0.0, 0.0)
+            if self.trial_drive:self.trial_drive.reset()
+        self.send_drive(0.0, 0.0, self.armed())
+
     def preview_patrol(self, data, sid):
         with self.lock:
             task = validate_task(data)
@@ -716,9 +765,19 @@ class NavigationRuntime:
         if action == 'status':
             return  # Read-only refresh; the web handler emits the current payload.
         if action in ('explore_preview','explore_start','explore_finish','patrol_start','mission_stop','alert_ack'):
-            if not self.autonomy:raise ValueError('自动任务模块尚未就绪')
-            return self.autonomy.control(data,sid)
-        if getattr(self,'autonomy',None) and self.autonomy.active and action not in ('heartbeat','cancel','stop'):
+            # Route patrol includes arrival settling and evidence recording.
+            if self.patrol_runner.active and action not in ('mission_stop',):
+                raise ValueError('请先停止当前巡检任务')
+            if action == 'patrol_start':
+                return self.patrol_runner.start(data,sid)
+            if action == 'mission_stop':
+                self.patrol_runner.cancel('操作者停止巡检')
+                if self.autonomy: self.autonomy.control(data,sid)
+                return
+            if self.autonomy:
+                return self.autonomy.control(data,sid)
+            raise ValueError('自动任务模块尚未就绪')
+        if (self.patrol_runner.active or (getattr(self,'autonomy',None) and self.autonomy.active)) and action not in ('heartbeat','cancel','stop'):
             raise ValueError('请先停止自动任务，再修改地图、目标或路线')
         if action == 'patrol_save':
             task = self.patrols.save(data.get('task'))
@@ -734,6 +793,7 @@ class NavigationRuntime:
         if action == 'heartbeat':
             with self.lock:
                 if self.autonomy:self.autonomy.heartbeat(sid)
+                if self.patrol_runner.active:self.patrol_runner.heartbeat(sid)
                 if self.navigating and sid == self.nav_owner:
                     self.last_client = time.monotonic()
             return
