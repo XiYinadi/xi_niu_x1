@@ -254,6 +254,8 @@ class SlamVizNode(Node):
         self._odometry = None
         self._last_imu_t = 0.0
         self._imu_acceleration = None
+        self._imu_gyro = None
+        self._imu_gyro_t = 0.0
         self._imu_frame = None
 
         # QoS: /map needs transient_local to receive last map immediately
@@ -369,6 +371,11 @@ class SlamVizNode(Node):
             self._last_imu_t = time.monotonic()
             self._imu_acceleration = values
             self._imu_frame = msg.header.frame_id
+            g = (float(msg.angular_velocity.x), float(msg.angular_velocity.y),
+                 float(msg.angular_velocity.z))
+            if all(math.isfinite(v) for v in g):
+                self._imu_gyro = g
+                self._imu_gyro_t = time.monotonic()
 
     def _odom_cb(self, msg: Odometry):
         x = msg.pose.pose.position.x

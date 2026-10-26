@@ -280,6 +280,15 @@ class NavigationRuntime:
                 state.pop('scan', None)
         return state
 
+    def gyro_z(self):
+        """GY-521 的 z 轴角速度（rad/s）；超过 0.3 秒没有新样本返回 None。"""
+        with self.node._lock:
+            gyro = getattr(self.node, '_imu_gyro', None)
+            stamp = getattr(self.node, '_imu_gyro_t', 0.0)
+        if not gyro or time.monotonic()-stamp > .3:
+            return None
+        return gyro[2]
+
     def localized(self, now):
         # AMCL need not republish covariance while stationary; TF must stay fresh.
         if getattr(self,'mode','localization') == 'mapping':

@@ -31,6 +31,10 @@ class PatrolRunner:
         self._rot_t = 0.0
         self._burst_until = 0.0
         self._settle_until = 0.0
+        self._rot_error0 = None
+        self._rot_done = 0.0
+        self._gyro_t = 0.0
+        self._gyro_seen = False
         self.rotate_target = None
 
     def camera_ready(self):
@@ -265,10 +269,10 @@ class PatrolRunner:
                 self._halt(str(exc))
 
     def _rotate(self, now):
-        """分段原地旋转：转一小段 -> 停 0.35s 等定位更新 -> 再判断。
+        """原地旋转：用陀螺仪积分做角度闭环（100Hz），不再等 7.8Hz 雷达。
 
-        连续快速旋转时雷达 7.8Hz + AMCL 跟不上，协方差会持续变大导致定位失效；
-        分段旋转把「转」和「观测」交替开，AMCL 每段之后都能重新收敛。
+        AMCL 位姿在纯旋转时滞后、协方差变大；GY-521 的 z 轴角速度 100Hz，
+        积分出来的「已转角度」足够控制这一小段旋转。转够后再用 AMCL 校验一次。
         """
         pose = self.nav.last_pose
         if pose is None:
@@ -279,10 +283,24 @@ class PatrolRunner:
             return
         self.pose_lost = None
         error = math.atan2(math.sin(self.rotate_target-pose['yaw']), math.cos(self.rotate_target-pose['yaw']))
-        if abs(error) < .10:
+        if self._rot_error0 is None:
+            self._rot_error0 = error
+            self._rot_done = 0.
+            self._gyro_t = now
+        else:
+            rate = self.nav.gyro_z()
+            if rate is not None:
+                self._rot_done += rate * max(0., min(.2, now-self._gyro_t))
+                self._gyro_seen = True
+            self._gyro_t = now
+        remaining = self._rot_error0 - self._rot_done
+        # 陀螺积分已到位，或 AMCL 角度已经很小 -> 结束这段旋转
+        gyro_done = abs(remaining) < .06 if self._gyro_seen else abs(error) < .10
+        if gyro_done or (abs(error) < .08 and abs(self._rot_done) > .05):
             self.nav.send_drive(0., 0., self.nav.armed(), 0.)
             self.rotate_target = None
-            self._burst_until = self._settle_until = 0.
+            self._rot_error0 = None
+            self._gyro_seen = False
             step, self.rotate_then = self.rotate_then, None
             if step == 'direct':
                 self.status, self.phase_started = 'direct', now
@@ -296,19 +314,9 @@ class PatrolRunner:
             return
         if now - self.phase_started > 30:
             raise ValueError('原地旋转超时，巡检停止')
-        # 当前在一个「转」的窗口里：保持速度
-        if now < self._burst_until:
-            self.nav.send_drive(0., 0., self.nav.armed(), self._rot_cmd)
-            return
-        # 当前在「停」的窗口里：发零，等雷达/AMCL 更新
-        if now < self._settle_until:
-            self.nav.send_drive(0., 0., self.nav.armed(), 0.)
-            return
-        # 新一段：按剩余角度决定时长和速度（慢转，0.30 上限）
-        burst = min(.5, max(.2, abs(error)/.5))
-        self._rot_cmd = math.copysign(min(.30, .10 + abs(error)*.6), error)
-        self._burst_until = now + burst
-        self._settle_until = self._burst_until + .35
+        # 连续慢转：0.12~0.22 占空比，剩余角度越小越慢
+        speed = min(.22, max(.10, abs(remaining)*.9))
+        self._rot_cmd = math.copysign(speed, remaining)
         self.nav.send_drive(0., 0., self.nav.armed(), self._rot_cmd)
 
     def _drive_direct(self, now):
