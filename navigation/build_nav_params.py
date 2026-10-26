@@ -38,7 +38,8 @@ def build():
             min_obstacle_height=0.0, max_obstacle_height=2.0,
             marking=True, clearing=True, obstacle_min_range=0.2, obstacle_max_range=3.0,
             raytrace_min_range=0.2, raytrace_max_range=4.0))
-        p['inflation_layer'].update(inflation_radius=0.45, cost_scaling_factor=3.0)
+        # 2026-10-26: 膨胀 0.45 -> 0.35、代价斜率 3.0 -> 4.0，避免窄处被逼着绕远路
+        p['inflation_layer'].update(inflation_radius=0.30, cost_scaling_factor=5.0)
         if key == 'global_costmap':
             p['static_layer'].update(map_subscribe_transient_local=True,subscribe_to_updates=True)
     planning_steering=cfg['trial_max_steering_rad']*.95 if trial else (cfg.get('max_steering_rad') or .4)
@@ -48,7 +49,7 @@ def build():
     planner = data['planner_server']['ros__parameters']
     planner['planner_plugins'] = ['GridBased']
     planner['GridBased'] = dict(plugin='nav2_smac_planner/SmacPlannerHybrid',
-        tolerance=0.15, downsample_costmap=False, allow_unknown=True,
+        tolerance=0.15, downsample_costmap=False, allow_unknown=False,
         max_iterations=200000, max_planning_time=5.0, motion_model_for_search='DUBIN',
         angle_quantization_bins=72, minimum_turning_radius=radius,
         analytic_expansion_ratio=3.5, analytic_expansion_max_length=max(3.0, 4*radius))

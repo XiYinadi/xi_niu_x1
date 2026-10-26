@@ -25,6 +25,9 @@ class PatrolRunner:
         self.arrived_at = self.phase_started = 0.
         self.record_id = None
         self.rotate_target = None
+        self.rotate_then = None
+        self.leg_target = None
+        self.rotate_target = None
 
     def camera_ready(self):
         if self.inspections is None:
@@ -205,6 +208,8 @@ class PatrolRunner:
                 self._guard(now)
                 if self.status == 'rotating':
                     return self._rotate(now)
+                if self.status == 'direct':
+                    return self._drive_direct(now)
                 if self.status == 'navigating':
                     if now-self.phase_started > self.nav.config.get('trial_max_duration_s', 180):
                         raise ValueError('点位导航超时，未计为到达')
@@ -255,6 +260,14 @@ class PatrolRunner:
         if abs(error) < .10:
             self.nav.send_drive(0., 0., self.nav.armed(), 0.)
             self.rotate_target = None
+            step, self.rotate_then = self.rotate_then, None
+            if step == 'direct':
+                self.status, self.phase_started = 'direct', now
+                return
+            if step == 'arrived':
+                self.status, self.arrived_at = 'dwell', now
+                self.phase_started, self.still_since = now, None
+                return
             self._next(self.epoch)
             return
         if now - self.phase_started > 20:
@@ -262,6 +275,39 @@ class PatrolRunner:
         # 角度越大转越快，限幅 0.55，避免齿轮/舵机冲击
         rot = max(-.55, min(.55, error*1.5))
         self.nav.send_drive(0., 0., self.nav.armed(), rot)
+
+    def _drive_direct(self, now):
+        """短腿直行：先对准方位，再低速直行，靠近后对准点位朝向。"""
+        pose = self.nav.last_pose
+        target = self.leg_target
+        if pose is None or target is None:
+            raise ValueError('定位失效，巡检停止')
+        distance = math.hypot(target['x']-pose['x'], target['y']-pose['y'])
+        if distance < .10:
+            self.nav.send_drive(0., 0., self.nav.armed(), 0.)
+            error = math.atan2(math.sin(target['yaw']-pose['yaw']), math.cos(target['yaw']-pose['yaw']))
+            if abs(error) > math.radians(15):
+                self.status, self.rotate_then = 'rotating', 'arrived'
+                self.rotate_target, self.phase_started = target['yaw'], now
+                return
+            self.status, self.arrived_at = 'dwell', now
+            self.phase_started, self.still_since = now, None
+            return
+        if now - self.phase_started > 30:
+            raise ValueError('直行段超时，巡检停止')
+        bearing = math.atan2(target['y']-pose['y'], target['x']-pose['x'])
+        error = math.atan2(math.sin(bearing-pose['yaw']), math.cos(bearing-pose['yaw']))
+        if abs(error) > math.radians(45):
+            self.status, self.rotate_then = 'rotating', 'direct'
+            self.rotate_target, self.phase_started = bearing, now
+            return
+        clearance = getattr(self.nav, 'trial_clearance', None)
+        if clearance is not None and clearance < .18:
+            raise ValueError('直行前方净空不足，巡检停止')
+        speed = .32 if distance > .35 else .20
+        steer = max(-.6, min(.6, error*1.5))
+        self.nav.send_drive(speed, steer, self.nav.armed(), 0.)
+        self.message = '直行 %d/%d · 距 %.2f m' % (self.index+1, self.total, distance)
 
     def _next(self, epoch):
         # All callers hold nav.lock through dispatch, serializing cancellation.
@@ -281,9 +327,22 @@ class PatrolRunner:
                 if math.hypot(p['x']-target['x'], p['y']-target['y']) > self.nav.config['trial_max_goal_m']:
                     raise ValueError('下一点超出单段试航距离限制')
             pose = self.nav.last_pose
-            if pose is not None and 'yaw' in target:
+            if pose is not None:
+                distance = math.hypot(target['x']-pose['x'], target['y']-pose['y'])
+                bearing = math.atan2(target['y']-pose['y'], target['x']-pose['x'])
+                if distance <= 2.0:
+                    self.leg_target = dict(target)
+                    heading = math.atan2(math.sin(bearing-pose['yaw']), math.cos(bearing-pose['yaw']))
+                    if abs(heading) > math.radians(12):
+                        self.status, self.rotate_then = 'rotating', 'direct'
+                        self.rotate_target, self.phase_started = bearing, time.monotonic()
+                        self.message = '原地旋转对准第 %d/%d 个点位（直行）' % (self.index+1, self.total)
+                        return
+                    self.status, self.phase_started = 'direct', time.monotonic()
+                    self.message = '直行前往第 %d/%d 个点位' % (self.index+1, self.total)
+                    return
                 heading = math.atan2(math.sin(target['yaw']-pose['yaw']), math.cos(target['yaw']-pose['yaw']))
-                if abs(heading) > math.radians(30):   # 2026-10-26: 阈值 60° -> 30°
+                if abs(heading) > math.radians(30):
                     self.status, self.message = 'rotating', '原地旋转对准第 %d/%d 个点位' % (self.index+1, self.total)
                     self.rotate_target = target['yaw']
                     self.phase_started = time.monotonic()
