@@ -1083,7 +1083,7 @@ _lat_samples = []
 _lat_last_log = 0.0
 
 
-def _send_drive(l, a, armed):
+def _send_drive(l, a, armed, rot=0.0):
     """把归一化摇杆值直发 pwm_proc(绕开 ROS)。
 
     尽力而为:没起 pwm_proc 时只是丢包,绝不能让这条路把网页的按键回调搞崩,
@@ -1095,7 +1095,7 @@ def _send_drive(l, a, armed):
     try:
         with _drive_io_lock:
             _pwm_sock.sendto(
-                json.dumps({"l": float(l), "a": float(a),
+                json.dumps({"l": float(l), "a": float(a), "rot": float(rot or 0.0),
                             "armed": bool(armed and _motor_armed)}).encode(),
                 (PWM_UDP_HOST, PWM_UDP_PORT))
     except OSError as e:

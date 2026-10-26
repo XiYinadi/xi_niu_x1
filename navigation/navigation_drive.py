@@ -14,7 +14,7 @@ def validate_navigation(config):
     # (0.12/20%/20°/0.7)。calibrated 仍为 false，这组数没有实车标定背书。
     # 2026-10-25: 标定前临时解除距离/角度限制（1m/1.2m/45s/20° -> 5m/6m/180s/25°）。
     # 传感器 0.4s 上限、净空 0.2m、速度 0.12m/s、PWM 20% 仍然生效。
-    limits={'max_speed_mps':.20,'trial_pwm_cap':.35,'trial_max_steering_rad':math.radians(25),
+    limits={'max_speed_mps':.28,'trial_pwm_cap':.45,'trial_max_steering_rad':math.radians(25),
         'trial_max_joystick':.85,'trial_max_duration_s':180.,'trial_max_goal_m':5.,
         'trial_max_travel_m':6.,'trial_max_path_m':6.}
     for key,maximum in limits.items():
@@ -53,7 +53,7 @@ class TrialDrive:
             # 2026-10-26: 进程停顿（VLM 推理等）会让 dt 变成数秒。
             # 这不是控制故障 —— 重置反馈、这一帧输出 0，下一帧照常。
             self.reset()
-            return 0., 0.
+            return 0., 0., 0.
         if v<0 or v>self.config['max_speed_mps']+.001:raise ValueError('试航仅允许0至%.2f m/s前进'%self.config['max_speed_mps'])
         # 2026-10-25: 单帧尖峰不中止；连续 3 帧超 0.60 m/s 才判异常。
         # 控制用的速度钳到 ±0.5，尖峰不直接进反馈环。
@@ -64,9 +64,15 @@ class TrialDrive:
             self.over=0
         measured_v=max(-.5,min(.5,measured_v))
         if v<.005:
-            # 舵机底盘不能原地转；终点前控制器偶尔会这么请求。宁可**停住**
-            # 交给目标检查器判定，也不要因为一句限制把已经走完的试航判死。
-            self.reset();return 0.,0.
+            # 2026-10-26: 大角度转向改成**原地旋转** —— 舵机回中、两轮反向。
+            # pwm_proc 的 rot 通道只认这个字段，手动摇杆永远不发，所以手动驾驶不变。
+            if abs(w) > .25:
+                limit = self.config.get('rotation_w', .8)
+                self.reset()
+                return 0., 0., max(-1., min(1., w/limit))
+            # 终点前控制器偶尔会请求很小的 v；宁可**停住**交给目标检查器判定，
+            # 也不要因为一句限制把已经走完的试航判死。
+            self.reset();return 0.,0.,0.
         # 2026-10-24: δ=atan(L·ω/v)。接近终点时控制器把 v 降到很低，同样的 ω
         # 折算出的 δ 会发散，最后几厘米被这条限制拦下。物理上舵机只能打到
         # maximum，所以**饱和执行**而不是中止；只有 v≈0 的原地转向才单独处理。
@@ -76,7 +82,7 @@ class TrialDrive:
             steering=math.copysign(maximum,steering)
         l,_=self.feedback.step(min(v,self.config['max_speed_mps']),0.,measured_v,0.,dt)
         a=self.config['steering_sign']*max(-1.,min(1.,steering/maximum))*self.config['trial_max_joystick']
-        return min(l,self.config['trial_pwm_cap']),a
+        return min(l,self.config['trial_pwm_cap']),a,0.
 
 def scan_clearance(scan,mount,config,corridor_deg=70.0):
     """Nearest live return in the FORWARD corridor of the measured rectangle.

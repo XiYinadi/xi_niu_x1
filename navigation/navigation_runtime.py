@@ -499,12 +499,13 @@ class NavigationRuntime:
                     _blocked=self._clearance_blocked(now)
                     if _blocked:raise ValueError(_blocked+'，试航停止')
                     dt=now-self.last_control_t;self.last_control_t=now
-                    l,a=self.trial_drive.step(*self.command,odom['vx'],dt)
+                    l,a,rot=self.trial_drive.step(*self.command,odom['vx'],dt)
                     stalled=self.command[0]>0 and l>.06 and abs(odom['vx'])<.003
                     self.trial_no_motion=(self.trial_no_motion or now) if stalled else None
                     if self.trial_no_motion and now-self.trial_no_motion>1.5:raise ValueError('车辆没有正常移动，试航停止')
-                else:l, a = twist_to_joystick(*self.command, self.config)
-                self.send_drive(l, a, self.armed())
+                else:
+                    l, a = twist_to_joystick(*self.command, self.config); rot = 0.0
+                self.send_drive(l, a, self.armed(), rot)
             except ValueError as e:
                 self.cancel(str(e), disarm=True)
 

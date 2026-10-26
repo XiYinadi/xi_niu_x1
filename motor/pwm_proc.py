@@ -324,6 +324,7 @@ class PwmProc:
 
         self._l = 0.0
         self._a = 0.0
+        self._rot = 0.0
         self._armed = False
         self._last_pkt = 0.0        # 0 = 从没收到过,不是「很久以前」
         self._age_ms = 0.0
@@ -368,6 +369,10 @@ class PwmProc:
                 self._a = max(-1.0, min(1.0, float(m.get('a', 0.0))))
             except (TypeError, ValueError):
                 continue
+            try:
+                self._rot = max(-1.0, min(1.0, float(m.get('rot', 0.0))))
+            except (TypeError, ValueError):
+                self._rot = 0.0
             self._armed = bool(m.get('armed', False))
             got = True
             # 按**报文**计数 —— 原来 += 1 在循环外,数的是「收到东西的调用次数」,
@@ -402,7 +407,23 @@ class PwmProc:
         # 那段时间状态机的计时会停摆,等恢复时算出来的"静止了多久"是假的。
         idle_now = self._idle_park.update(self._l, self._a, now)
 
-        if stale or not self._armed:
+        # 2026-10-26: 原地旋转通道。rot 只由导航/巡检层发送（手动摇杆从不为非零），
+        # 所以「打方向但油门为零」在手动驾驶里仍然是「不动」。
+        rot = self._rot if (not stale and self._armed) else 0.0
+        rotating = abs(rot) > .02
+        if rotating:
+            # 通道 L 物理上是**右**轮、通道 R 是**左**轮（见 motor_wiring.md）。
+            # rot > 0 = 左转 = 右轮前进、左轮后退。
+            # flip_* 是对接线极性的补偿，这里直接反算 s 使 dir 落到想要的方向，
+            # **不要**再套 swap_lr/左右互换 —— 那会让两轮同向（实测 dir L=0 R=0）。
+            f_l = -1.0 if self._flip_l else 1.0
+            f_r = -1.0 if self._flip_r else 1.0
+            want_l = rot > 0
+            want_r = rot < 0
+            spin = min(1.0, abs(rot))
+            s_l = spin if (want_l == (f_l > 0)) else -spin
+            s_r = spin if (want_r == (f_r > 0)) else -spin
+        elif stale or not self._armed:
             s_l = s_r = 0.0
         else:
             # steer_mode='servo' 时给混控喂 a=0:轮子只吃油门,两轮等速。
@@ -448,7 +469,7 @@ class PwmProc:
         if self.servo is not None:
             # not self._a_to_servo(即 steer_mode='diff')时恒 park:此时转向由
             # 差速做,舵机若跟着动就是两个机构对着掰,车会又转又拧。
-            if stale or not self._armed or not self._a_to_servo:
+            if stale or not self._armed or not self._a_to_servo or rotating:
                 self.servo.park()
             # 车既没在动也没在转 → 舵机松掉(不发脉冲 = 不纠偏 = 不嗡嗡 = 不吃电)。
             # ⚠️ 这一层**不是**给链路加的滞回(那会回归成「电机停了、舵机还咬着

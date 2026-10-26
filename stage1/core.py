@@ -20,7 +20,7 @@ class Feedback:
     A zero target bypasses PI immediately. Missing feedback is handled by bridge.
     """
     def __init__(self, k, duty_cap=.10):
-        if not math.isfinite(k) or k<=0 or not 0<duty_cap<=.40:
+        if not math.isfinite(k) or k<=0 or not 0<duty_cap<=.55:
             raise ValueError('invalid conversion or diagnostic duty cap')
         self.k, self.cap = k, duty_cap
         self.reset()

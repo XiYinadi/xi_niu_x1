@@ -15,7 +15,7 @@ max_steering_rad: null
 full_throttle_mps: null
 # Physical stationary trials: positive joystick a turns vehicle LEFT.
 steering_sign: 1
-max_speed_mps: 0.20   # 2026-10-24 抬包络：原 0.05 是 6.5/95cm 实车验证值；
+max_speed_mps: 0.28   # 2026-10-26 提速：0.20 -> 0.28（仍属未标定包络）   # 2026-10-24 抬包络：原 0.05 是 6.5/95cm 实车验证值；
                       # 0.12 属于未标定实验包络（calibrated 仍为 false）
 command_timeout_s: 0.25   # 传感器超时 0.4s 是试航模式的硬上限（navigation_drive.validate_navigation）；
                           # 进程自身停顿造成的误判由 runtime.tick 的 stall 补偿处理
@@ -27,7 +27,9 @@ localization_timeout_s: 3.0
 # Keep calibrated=false: the 95cm/100.1cm error and dynamic turning remain open.
 # Only supervised SINGLE goals are enabled by this separate bounded profile.
 navigation_mode: supervised_trial
-trial_pwm_cap: 0.35
+trial_pwm_cap: 0.45
+# 原地旋转：rot 归一化对应的角速度（rad/s）；纯旋转请求按 w/rotation_w 映射
+rotation_w: 0.8   # 2026-10-26 配合 0.28 m/s 提速
 trial_max_steering_rad: 0.4363323129985824
 trial_max_joystick: 0.85
 trial_max_duration_s: 180.0
