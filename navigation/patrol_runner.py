@@ -283,7 +283,7 @@ class PatrolRunner:
             pose = self.nav.last_pose
             if pose is not None and 'yaw' in target:
                 heading = math.atan2(math.sin(target['yaw']-pose['yaw']), math.cos(target['yaw']-pose['yaw']))
-                if abs(heading) > 1.05:
+                if abs(heading) > math.radians(30):   # 2026-10-26: 阈值 60° -> 30°
                     self.status, self.message = 'rotating', '原地旋转对准第 %d/%d 个点位' % (self.index+1, self.total)
                     self.rotate_target = target['yaw']
                     self.phase_started = time.monotonic()
