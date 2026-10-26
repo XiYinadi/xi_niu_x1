@@ -267,4 +267,40 @@ def register_map_editor(app, node_getter, navigation_getter, asset_root=None):
             if hasattr(nav,'emit'): nav.emit()
             return dict(saved=name,maps=nav.store.list())
         return handle(run)
+    @app.get('/api/map-editor/regions')
+    def map_editor_regions():
+        def run():
+            store = navigation().store
+            return dict(name=checked_name(request.args.get('name','')),
+                        regions=store.regions(request.args.get('name','')))
+        return handle(run)
+
+    @app.post('/api/map-editor/regions')
+    def map_editor_save_regions():
+        def run():
+            data = body(); nav = navigation()
+            name = checked_name(data.get('name'))
+            regions = nav.store.save_regions(name, data.get('regions'))
+            if hasattr(nav, 'emit'):
+                nav.emit()
+            return dict(saved=name, regions=regions)
+        return handle(run)
+
+    @app.post('/api/map-editor/delete')
+    def map_editor_delete():
+        def run():
+            data = body(); nav = navigation()
+            name = checked_name(data.get('name'))
+            if getattr(nav, 'active_map', None) == name:
+                raise ValueError('这张地图正在定位中使用，请先停止定位再删除')
+            bound = [t.get('name') for t in (nav.patrols.list() if hasattr(nav, 'patrols') else [])
+                     if t.get('map') == name]
+            if bound:
+                raise ValueError('还有巡检任务绑定这张地图（' + '、'.join(bound) + '），请先删除任务')
+            moved = nav.store.delete(name)
+            if hasattr(nav, 'emit'):
+                nav.emit()
+            return dict(deleted=name, moved_to=moved, maps=nav.store.list())
+        return handle(run)
+
     return editor

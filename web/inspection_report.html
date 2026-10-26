@@ -35,12 +35,13 @@ details{margin-top:6px}
 summary{cursor:pointer;color:var(--dim);font-size:12px}
 ul{margin:6px 0 0 18px;padding:0}
 .fineprint{margin-top:28px;padding-top:14px;border-top:1px solid var(--line);font-size:11px;color:#77808b;line-height:1.8}
+.region-table{width:100%;border-collapse:collapse;font-size:12px;margin:8px 0 4px}.region-table th,.region-table td{border-bottom:1px solid var(--line);padding:7px 8px;text-align:left}.region-table th{color:var(--dim);font-weight:500;font-size:11px}.region-table td:nth-child(n+2),.region-table th:nth-child(n+2){text-align:right}
 @media(max-width:720px){.report{padding:24px 18px;margin:0 10px 24px}.cards{grid-template-columns:repeat(2,1fr)}.point{flex-direction:column}.thumb{width:100%;height:auto}.toolbar{flex-wrap:wrap}}
 @media print{body{background:#fff}.toolbar{display:none}.report{box-shadow:none;max-width:none;margin:0;padding:0}@page{size:A4;margin:16mm}.point{break-inside:avoid}a{color:inherit;text-decoration:none}}
 </style></head><body>
 <nav class="toolbar"><a href="/inspection">← 返回巡检工作台</a><button onclick="window.print()">打印 / 导出 PDF</button><a href="/inspection/reports/{{s.id}}/data">下载原始 JSON</a></nav>
 <article class="report">
-<div class="kicker">RHINO ONE · INSPECTION RECORD</div>
+<div class="kicker">RHINO PI · INSPECTION RECORD</div>
 <h1>{{s.title}}</h1>
 <div class="meta">{{'自动' if s.mode=='automatic' else '人工'}}巡检 · 编号 <b>{{s.id[:12]}}</b>{% if s.task %} · 路线 <b>{{s.task.name}}</b> · 地图 <b>{{s.task.map}}</b>{% endif %}<br>开始 <b>{{s.started_at}}</b>　结束 <b>{{s.ended_at}}</b>{% if duration is not none %}　用时 <b>{{duration}} 秒</b>{% endif %}</div>
 {% set overall = s.stats.overall %}
@@ -58,7 +59,7 @@ ul{margin:6px 0 0 18px;padding:0}
 <section class="point">
 {% if p.record and p.record.image %}<img class="thumb" src="/inspection/evidence/{{s.id}}/{{p.record.image}}" alt="点位 {{p.index}} 检测证据">{% endif %}
 <div class="body">
-<h3>{% if p.record and p.record.label %}{{p.record.label}}{% else %}点位 {{p.index}}{% endif %}
+<h3>{% if p.record and p.record.label %}{{p.record.label}}{% else %}点位 {{p.index}}{% endif %}{% if p.region %} · {{p.region}}{% endif %}
 {% if p.record %}
 {% if p.record.status!='ok' %}<span class="tag missing">未完成</span>
 {% elif p.record.verdict=='suspected' %}<span class="tag suspected">疑似火情</span>
@@ -89,7 +90,12 @@ ul{margin:6px 0 0 18px;padding:0}
 </section>
 {% endfor %}
 {% endif %}
-<h2>本地模型分析</h2>
+{% if region_rows %}
+<h2>按区域汇总</h2>
+<table class="region-table"><thead><tr><th>区域</th><th>计划</th><th>有效</th><th>疑似</th><th>未检测</th><th>待复核</th></tr></thead><tbody>
+{% for r in region_rows %}<tr><td>{{r.name}}</td><td>{{r.planned}}</td><td>{{r.checked}}</td><td>{{r.suspected}}</td><td>{{r.missing}}</td><td>{{r.uncertain}}</td></tr>{% endfor %}
+</tbody></table>
+{% endif %}<h2>本地模型分析</h2>
 {% if s.report_status=='ready' and s.analysis %}
 <p class="small">模型：{{s.analysis.model}} · 生成于 {{s.analysis.generated_at}}</p>
 <p>{{s.analysis.summary}}</p>

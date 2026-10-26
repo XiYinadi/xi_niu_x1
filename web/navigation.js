@@ -56,7 +56,21 @@
     try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
   }, true);
   canvas.addEventListener('pointermove', e => { if (pick) {intercept(e);if(anchor)pickTip=world(e);} }, true);
-  canvas.addEventListener('pointerup', e => {
+  function inPolygon(x, y, poly) {
+  if (!poly || poly.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1];
+    if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi || 1e-12) + xi)) inside = !inside;
+  }
+  return inside;
+}
+function polyCentroid(poly) {
+  let x = 0, y = 0;
+  for (const p of poly) { x += p[0]; y += p[1]; }
+  return [x / poly.length, y / poly.length];
+}
+canvas.addEventListener('pointerup', e => {
     if (!pick || !anchor) return;
     intercept(e);
     const tip = world(e);
@@ -68,6 +82,11 @@
       return;
     }
     const pose = { ...anchor, yaw: Math.atan2(tip.y-anchor.y, tip.x-anchor.x) };
+let snappedRegion = null;
+if (pick !== 'initial_pose' && window.__navRegions) {
+  const r = window.__navRegions.find(r => inPolygon(pose.x, pose.y, r.points));
+  if (r) { const c = polyCentroid(r.points); pose.x = c[0]; pose.y = c[1]; snappedRegion = r; }
+}
     const action = pick;
     pick = null; anchor = null; pickTip = null; pickStart = null;canvas.navPick=null;canvas.navPickNotice='';
     try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
@@ -79,6 +98,7 @@
     }
     else if (action === 'initial_pose') send(action, pose);
     else { target = pose; send('preview', pose); }
+if (snappedRegion) { stateEl.textContent = '已选中区域：' + snappedRegion.name + '（' + pose.x.toFixed(2) + ', ' + pose.y.toFixed(2) + '）'; }
   }, true);
   canvas.addEventListener('pointercancel', () => { pick = null; anchor = null;pickTip=null;pickStart=null;canvas.navPick=null;canvas.navPickNotice=''; });
   const paintDraft = () => {
@@ -141,6 +161,7 @@
   socket.on('navigation_state', d => {
     if (state && d.selected_map !== state.selected_map) { target=null;pick=null;anchor=null;pickTip=null;pickStart=null;canvas.navPick=null;canvas.navPickNotice='';previewMode=null; }
     state = d;
+  window.__navRegions = d.regions || [];
     if (d.running) trajectoryPoints = [];
     const selected = select.value;
     select.innerHTML = (d.maps || []).map(name => '<option value="'+name+'">'+name+'</option>').join('');

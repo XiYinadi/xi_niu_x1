@@ -1,7 +1,7 @@
 'use strict';
 (() => {
  const el=id=>document.getElementById(id),canvas=el('edit-canvas'),ctx=canvas.getContext('2d');
- const state={source:null,image:null,originalImage:null,operations:[],redo:[],draft:[],mode:'view',
+ const state={source:null,image:null,originalImage:null,operations:[],redo:[],draft:[],regions:[],regionDirty:false,mode:'view',
   revision:0,previewRevision:-1,savedRevision:-1,sourceBusy:false,previewBusy:false,saving:false,
   changed:0,previewId:0,saveRequest:null,view:{x:0,y:0,scale:1},pointer:null,space:false};
  let cw=1,ch=1;
@@ -15,9 +15,9 @@
  }
  async function decode(data){const image=new Image();image.src='data:image/png;base64,'+data;await image.decode();return image;}
  function buttons(){
-  const loaded=!!state.source,locked=busy(),minimum=state.mode==='unknown'?3:2;
+  const loaded=!!state.source,locked=busy(),minimum=state.mode==='region'?3:state.mode==='unknown'?3:2;
   el('load-live').disabled=locked;el('load-saved').disabled=locked||!el('map-list').value;el('map-list').disabled=locked;
-  for(const mode of ['view','unknown','wall']){const b=el('tool-'+mode);b.disabled=!loaded||locked;b.classList.toggle('selected',state.mode===mode);b.setAttribute('aria-pressed',String(state.mode===mode));}
+  for(const mode of ['view','unknown','wall','region']){const b=el('tool-'+mode);b.disabled=!loaded||locked;b.classList.toggle('selected',state.mode===mode);b.setAttribute('aria-pressed',String(state.mode===mode));}
   el('finish').disabled=locked||state.mode==='view'||state.draft.length<minimum;
   el('cancel-draft').disabled=locked||!state.draft.length;
   el('undo').disabled=locked||(!state.operations.length&&!state.draft.length);
@@ -33,11 +33,25 @@
   const list=el('operations');list.replaceChildren();
   if(!state.operations.length){const li=document.createElement('li');li.textContent='尚无标注';li.className='muted';list.append(li);}
   for(const op of state.operations){const li=document.createElement('li');li.textContent=op.type==='unknown'?`清理伪区域 · ${op.points.length} 个顶点`:`玻璃障碍墙 · ${op.points.length} 个点 / ${Math.round(op.width_m*100)} cm`;list.append(li);}
+  el('save-regions').disabled=locked||!loaded||!state.regionDirty||state.source.source==='live_snapshot';
+  el('region-count').textContent=(state.regions.length||0)+' 个区域';
+  const rlist=el('region-list');rlist.replaceChildren();
+  if(!state.regions.length){const li=document.createElement('li');li.textContent='尚无区域';li.className='muted';rlist.append(li);}
+  for(const r of state.regions){const li=document.createElement('li');const dot=document.createElement('i');dot.style.background=r.color;dot.className='region-dot';const span=document.createElement('span');span.textContent=r.name+(r.area_m2?' · '+r.area_m2+' m²':'');const del=document.createElement('button');del.type='button';del.className='region-del';del.textContent='删除';del.addEventListener('click',()=>{if(busy())return;state.regions=state.regions.filter(x=>x!==r);state.regionDirty=true;buttons();draw();});li.append(dot,span,del);rlist.append(li);}
  }
  function draw(){
   const dpr=window.devicePixelRatio||1;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,cw,ch);
   if(!state.image)return;
   const v=state.view;ctx.imageSmoothingEnabled=false;ctx.drawImage(state.image,v.x,v.y,state.source.width*v.scale,state.source.height*v.scale);
+  if(state.regions.length&&state.source){
+   for(const r of state.regions){
+    if(!r.points||r.points.length<3)continue;
+    ctx.beginPath();r.points.forEach((pt,i)=>{const [u,vv]=toPixel(pt);const sx=v.x+(u+.5)*v.scale,sy=v.y+(vv+.5)*v.scale;i?ctx.lineTo(sx,sy):ctx.moveTo(sx,sy);});ctx.closePath();
+    ctx.fillStyle=r.color+'33';ctx.fill();ctx.strokeStyle=r.color;ctx.lineWidth=2;ctx.stroke();
+    let cx=0,cy=0;for(const p of r.points){cx+=p[0];cy+=p[1];}cx/=r.points.length;cy/=r.points.length;
+    const [cu,cv]=toPixel([cx,cy]);ctx.fillStyle='#fff';ctx.font='13px Segoe UI,Microsoft YaHei';ctx.textAlign='center';ctx.fillText(r.name,v.x+(cu+.5)*v.scale,v.y+(cv+.5)*v.scale);
+   }
+  }
   if(state.draft.length){
    ctx.strokeStyle=state.mode==='unknown'?'#f3a36d':'#50c8c6';ctx.fillStyle=state.mode==='unknown'?'#f3a36d33':'#50c8c633';ctx.lineWidth=2;ctx.setLineDash([6,4]);ctx.beginPath();
    state.draft.forEach(([x,y],i)=>{const sx=v.x+(x+.5)*v.scale,sy=v.y+(y+.5)*v.scale;i?ctx.lineTo(sx,sy):ctx.moveTo(sx,sy);});
@@ -52,11 +66,13 @@
  el('zoom-in').addEventListener('click',()=>zoom(1.4));el('zoom-out').addEventListener('click',()=>zoom(1/1.4));el('zoom-fit').addEventListener('click',fit);
  canvas.addEventListener('wheel',e=>{if(!state.source)return;e.preventDefault();const r=canvas.getBoundingClientRect();zoom(Math.exp(-e.deltaY*.0015),e.clientX-r.left,e.clientY-r.top);},{passive:false});
  function pixel(x,y){const v=state.view;return[Math.floor((x-v.x)/v.scale),Math.floor((y-v.y)/v.scale)];}
+ function toWorld([u,v]){const res=state.source.resolution,o=state.source.origin,lx=(u+.5)*res,ly=(state.source.height-v-.5)*res,c=Math.cos(o[2]),s=Math.sin(o[2]);return[o[0]+c*lx-s*ly,o[1]+s*lx+c*ly];}
+ function toPixel([wx,wy]){const res=state.source.resolution,o=state.source.origin,dx=wx-o[0],dy=wy-o[1],c=Math.cos(o[2]),s=Math.sin(o[2]),lx=c*dx+s*dy,ly=-s*dx+c*dy;return[lx/res-.5,state.source.height-ly/res-.5];}
  function mode(value,clearDraft=true){if(busy())return;if(clearDraft)state.draft=[];state.mode=value;
-  el('tool-title').textContent={view:'浏览地图',unknown:'圈选伪区域',wall:'沿玻璃描画障碍墙'}[value];
-  el('tool-hint').textContent={view:'拖动画布平移，滚轮或下方按钮缩放。',unknown:'依次点击伪区域的边缘，至少选 3 个顶点，再点击完成标注。灰色预览表示未知区。',wall:'沿玻璃边界依次点击，至少选 2 个点，再点击完成标注。黑色墙线会写入清理后的地图。'}[value];
+  el('tool-title').textContent={view:'浏览地图',unknown:'圈选伪区域',wall:'沿玻璃描画障碍墙',region:'划分房间 / 区域'}[value];
+  el('tool-hint').textContent={view:'拖动画布平移，滚轮或下方按钮缩放。',unknown:'依次点击伪区域的边缘，至少选 3 个顶点，再点击完成标注。灰色预览表示未知区。',wall:'沿玻璃边界依次点击，至少选 2 个点，再点击完成标注。黑色墙线会写入清理后的地图。',region:'沿房间边界依次点击（至少 3 个点），回车或「完成标注」后输入名称，例如客厅、卧室、厨房。'}[value];
   buttons();draw();}
- for(const value of ['view','unknown','wall'])el('tool-'+value).addEventListener('click',()=>mode(value));
+ for(const value of ['view','unknown','wall','region'])el('tool-'+value).addEventListener('click',()=>mode(value));
  canvas.addEventListener('pointerdown',e=>{if(busy()||!state.source||e.button!==0)return;const r=canvas.getBoundingClientRect();state.pointer={id:e.pointerId,x:e.clientX-r.left,y:e.clientY-r.top,lastX:e.clientX-r.left,lastY:e.clientY-r.top,moved:false,pan:state.mode==='view'||state.space};canvas.setPointerCapture(e.pointerId);canvas.focus();});
  canvas.addEventListener('pointermove',e=>{const r=canvas.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top;
   if(state.source){const [u,v]=pixel(x,y);if(u>=0&&v>=0&&u<state.source.width&&v<state.source.height){const res=state.source.resolution,o=state.source.origin,lx=(u+.5)*res,ly=(state.source.height-v-.5)*res,c=Math.cos(o[2]),s=Math.sin(o[2]);el('cursor-info').textContent=`X ${(o[0]+c*lx-s*ly).toFixed(2)} m · Y ${(o[1]+s*lx+c*ly).toFixed(2)} m`;}}
@@ -75,7 +91,21 @@
   finally{if(id===state.previewId){state.previewBusy=false;buttons();}}
  }
  el('retry-preview').addEventListener('click',preview);
- function finish(){if(el('finish').disabled)return;const op={type:state.mode,points:state.draft.map(p=>[...p])};if(op.type==='wall')op.width_m=Number(el('wall-width').value);state.operations.push(op);state.redo=[];state.draft=[];revised();preview();}
+ function finish(){
+  if(el('finish').disabled)return;
+  if(state.mode==='region'){
+   const name=window.prompt('区域名称（例如 客厅 / 卧室 / 厨房）','');
+   if(name===null)return;
+   const title=name.trim();
+   if(!title){status('区域名称不能为空',true);return;}
+   if(state.regions.some(r=>r.name===title)){status('区域名称不能重复：'+title,true);return;}
+   const colors=['#4f9dff','#f3a36d','#7bd88f','#c792ea','#ffd166','#ef6f6c'];
+   state.regions.push({name:title,color:colors[state.regions.length%colors.length],points:state.draft.map(p=>toWorld(p))});
+   state.regionDirty=true;state.draft=[];buttons();draw();
+   status('已添加区域：'+title+'。点「保存区域」写入地图。');
+   return;
+  }
+  const op={type:state.mode,points:state.draft.map(p=>[...p])};if(op.type==='wall')op.width_m=Number(el('wall-width').value);state.operations.push(op);state.redo=[];state.draft=[];revised();preview();}
  el('finish').addEventListener('click',finish);el('cancel-draft').addEventListener('click',()=>{state.draft=[];buttons();draw();});
  function undo(){if(el('undo').disabled)return;if(state.draft.length){state.draft.pop();buttons();draw();return;}state.redo.push(state.operations.pop());revised();preview();}
  function redo(){if(el('redo').disabled)return;state.operations.push(state.redo.pop());revised();preview();}
@@ -83,17 +113,34 @@
  el('reset').addEventListener('click',()=>{if(busy())return;state.operations=[];state.redo=[];state.draft=[];revised();state.changed=0;state.image=state.originalImage;state.previewRevision=state.revision;el('retry-preview').hidden=true;buttons();draw();status('已还原载入时的快照。');});
  document.addEventListener('keydown',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName))return;if(e.code==='Space'){state.space=true;e.preventDefault();}if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();e.shiftKey?redo():undo();}else if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='y'){e.preventDefault();redo();}else if(e.key==='Enter'&&state.draft.length){e.preventDefault();finish();}else if(e.key==='Escape'){state.draft=[];buttons();draw();}});
  document.addEventListener('keyup',e=>{if(e.code==='Space')state.space=false;});window.addEventListener('blur',()=>{state.space=false;state.pointer=null;});
- window.addEventListener('beforeunload',e=>{if(dirty()||state.draft.length){e.preventDefault();e.returnValue='';}});
+ window.addEventListener('beforeunload',e=>{if(dirty()||state.draft.length||state.regionDirty){e.preventDefault();e.returnValue='';}});
  function mapOptions(maps){const select=el('map-list'),before=select.value;select.replaceChildren();const empty=document.createElement('option');empty.value='';empty.textContent='选择已保存地图';select.append(empty);for(const name of maps){const option=document.createElement('option');option.value=name;option.textContent=name;select.append(option);}if(maps.includes(before))select.value=before;buttons();}
  async function load(source,name){
   if(busy())return;if((dirty()||state.draft.length)&&!window.confirm('载入地图会清除尚未另存的标注，继续吗？'))return;
   state.sourceBusy=true;buttons();status('正在载入地图快照…');
   try{const result=await api('source',{source,name}),image=await decode(result.image);state.source=result;state.image=image;state.originalImage=image;state.operations=[];state.redo=[];state.draft=[];state.changed=0;state.revision=0;state.previewRevision=0;state.savedRevision=-1;state.saveRequest=null;
    el('empty').hidden=true;el('retry-preview').hidden=true;el('open-saved').hidden=true;el('source-info').textContent=`${source==='live'?'当前地图快照':result.source} · ${result.width} × ${result.height} · ${(result.resolution*100).toFixed(1)} cm/格`;
-   const suffix=new Date().toISOString().replace(/\D/g,'').slice(0,14);el('save-name').value=(source==='live'?'map':name.slice(0,35))+'_clean_'+suffix;state.mode='view';fit();status('快照已载入。先清理伪区域，再沿玻璃补画墙线。');
+   const suffix=new Date().toISOString().replace(/\D/g,'').slice(0,14);el('save-name').value=(source==='live'?'map':name.slice(0,35))+'_clean_'+suffix;state.mode='view';fit();state.regions=[];state.regionDirty=false;status('快照已载入。先清理伪区域，再沿玻璃补画墙线；也可以划分房间区域。');
   }catch(error){status(error.message,true);}finally{state.sourceBusy=false;mode(state.mode,false);buttons();}
  }
+ el('delete-map').addEventListener('click',async()=>{
+  const name=el('map-list').value;
+  if(!name){status('请先选择要删除的地图',true);return;}
+  if(!window.confirm('确定删除地图「'+name+'」？会移到回收目录 .trash，可人工恢复。'))return;
+  try{status('正在删除 '+name+' …');const result=await api('delete',{name});
+   mapOptions(result.maps);
+   if(state.source&&state.source.source===name){state.source=null;state.image=null;state.originalImage=null;state.regions=[];el('empty').hidden=false;el('source-info').textContent='尚未载入地图';}
+   status('已删除地图：'+name+'（移动到 .trash/'+result.moved_to+'）');
+  }catch(error){status(error.message,true);}
+ });
  el('load-live').addEventListener('click',()=>load('live'));el('load-saved').addEventListener('click',()=>load('saved',el('map-list').value));el('map-list').addEventListener('change',buttons);
+ el('save-regions').addEventListener('click',async()=>{
+  if(el('save-regions').disabled)return;
+  const name=state.source&&state.source.source;
+  if(!name||name==='live_snapshot'){status('请先载入一张已保存的地图，区域会随该地图保存。',true);return;}
+  try{status('正在保存区域…');const result=await api('regions',{name,regions:state.regions});state.regions=result.regions||[];state.regionDirty=false;buttons();draw();status('区域已保存到地图 '+name+'（'+state.regions.length+' 个）。');}
+  catch(error){status(error.message,true);}
+ });
  el('save-map').addEventListener('click',async()=>{
   if(el('save-map').disabled)return;const name=el('save-name').value.trim();if(!/^[A-Za-z0-9_-]{1,64}$/.test(name)){status('请输入 1–64 个英文字母、数字、下划线或短横线',true);el('save-name').focus();return;}
   if(!state.saveRequest||state.saveRequest.name!==name||state.saveRequest.revision!==state.revision)state.saveRequest={name,revision:state.revision,id:Array.from(crypto.getRandomValues(new Uint8Array(16)),n=>n.toString(16).padStart(2,'0')).join('')};

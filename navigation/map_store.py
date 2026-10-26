@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -32,6 +33,70 @@ class MapStore:
         if not path.is_file() or path.resolve().parent.parent != self.root:
             raise ValueError('地图不存在或路径不合法')
         return path
+
+    # ── 2026-10-26: 语义区域（客厅/卧室/厨房…），按地图存 regions.json ──
+    REGION_COLORS = ('#4f9dff', '#f3a36d', '#7bd88f', '#c792ea', '#ffd166', '#ef6f6c')
+
+    def regions(self, name):
+        path = self.path(name).parent / 'regions.json'
+        if not path.is_file():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            return []
+        return data.get('regions') if isinstance(data, dict) and isinstance(data.get('regions'), list) else []
+
+    def save_regions(self, name, regions):
+        self.path(name)  # 地图必须存在
+        if not isinstance(regions, list) or len(regions) > 40:
+            raise ValueError('区域数量须在 0–40 之间')
+        cleaned, names = [], set()
+        for item in regions:
+            if not isinstance(item, dict):
+                raise ValueError('区域格式无效')
+            title = item.get('name')
+            if not isinstance(title, str) or not 1 <= len(title.strip()) <= 20:
+                raise ValueError('区域名称须为 1–20 个字')
+            title = title.strip()
+            if title in names:
+                raise ValueError('区域名称不能重复：'+title)
+            names.add(title)
+            color = item.get('color')
+            if not (isinstance(color, str) and re.fullmatch(r'#[0-9a-fA-F]{6}', color)):
+                color = self.REGION_COLORS[len(cleaned) % len(self.REGION_COLORS)]
+            points = item.get('points')
+            if not isinstance(points, list) or not 3 <= len(points) <= 200:
+                raise ValueError('区域至少 3 个、最多 200 个顶点')
+            poly = []
+            for p in points:
+                if (not isinstance(p, (list, tuple)) or len(p) != 2
+                        or not all(type(v) in (int, float) and math.isfinite(v) for v in p)):
+                    raise ValueError('区域坐标无效')
+                poly.append([round(float(p[0]), 4), round(float(p[1]), 4)])
+            area = abs(sum(a[0]*b[1]-b[0]*a[1] for a, b in zip(poly, poly[1:]+poly[:1])))/2
+            if area < 0.01:
+                raise ValueError('区域面积过小：'+title)
+            cleaned.append(dict(name=title, color=color, points=poly, area_m2=round(area, 3)))
+        path = self.path(name).parent / 'regions.json'
+        tmp = path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(dict(map=name, regions=cleaned), ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
+        os.replace(tmp, path)
+        return cleaned
+
+    def delete(self, name):
+        """移到 .trash/，不真删；调用方负责拒绝正在使用的地图。"""
+        folder = self.path(name).parent
+        trash = self.root / '.trash'
+        trash.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        target = trash / (name + '-' + stamp)
+        n = 1
+        while target.exists():
+            target = trash / (name + '-' + stamp + '-' + str(n))
+            n += 1
+        shutil.move(str(folder), str(target))
+        return target.name
 
     def save(self, msg, name):
         name = checked_name(name)

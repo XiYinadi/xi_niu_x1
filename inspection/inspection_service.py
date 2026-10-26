@@ -16,6 +16,32 @@ from flask import Blueprint, jsonify, request, send_file, render_template_string
 from local_model import completion, loaded_model
 
 
+def point_in_polygon(x, y, poly):
+    if not isinstance(poly, list) or len(poly) < 3:
+        return False
+    inside = False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = poly[i][0], poly[i][1]
+        xj, yj = poly[j][0], poly[j][1]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def load_map_regions(inspections_root, map_name):
+    if not map_name:
+        return []
+    path = Path(inspections_root).parent / 'maps' / map_name / 'regions.json'
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return []
+    regions = data.get('regions') if isinstance(data, dict) else None
+    return regions if isinstance(regions, list) else []
+
+
 def timestamp():
     return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).isoformat(timespec='seconds')
 
@@ -381,20 +407,46 @@ def register_inspection(app, service, webroot):
         task=s.get('task') or {}
         waypoints=task.get('waypoints') or []
         by_step={r.get('step'):r for r in s.get('records',[])}
+        regions=load_map_regions(service.root, task.get('map'))
+        def region_of(point):
+            if not isinstance(point, dict):
+                return None
+            x, y = point.get('x'), point.get('y')
+            if type(x) not in (int, float) or type(y) not in (int, float):
+                return None
+            for region in regions:
+                if point_in_polygon(float(x), float(y), region.get('points')):
+                    return region.get('name')
+            return None
         points=[]
         for i,wp in enumerate(waypoints):
-            points.append(dict(index=i+1,planned=wp,record=by_step.get(i)))
+            points.append(dict(index=i+1,planned=wp,record=by_step.get(i),region=region_of(wp)))
         for step,rec in sorted(by_step.items(),key=lambda kv:(kv[0] is None, kv[0] or 0)):
             if not isinstance(step,int) or step>=len(waypoints):
                 points.append(dict(index=(step+1) if isinstance(step,int) else len(points)+1,
-                                   planned=None,record=rec))
+                                   planned=None,record=rec,region=region_of(rec.get('planned_pose') or {})))
+        region_stats={}
+        for p in points:
+            name=p['region'] or '未划分区域'
+            row=region_stats.setdefault(name,dict(name=name,planned=0,checked=0,suspected=0,missing=0,uncertain=0))
+            row['planned']+=1
+            rec=p['record']
+            if not rec or rec.get('status')!='ok':
+                row['missing']+=1
+            elif rec.get('verdict')=='suspected':
+                row['suspected']+=1;row['checked']+=1
+            elif rec.get('verdict')=='uncertain':
+                row['uncertain']+=1;row['checked']+=1
+            else:
+                row['checked']+=1
+        region_rows=sorted(region_stats.values(),key=lambda r:(-r['planned'],r['name']))
         duration=None
         try:
             duration=int((datetime.datetime.fromisoformat(s['ended_at'])-datetime.datetime.fromisoformat(s['started_at'])).total_seconds())
         except (KeyError,TypeError,ValueError):
             duration=None
         return render_template_string((webroot/'inspection_report.html').read_text(),
-                                      s=s,points=points,duration=duration)
+                                      s=s,points=points,duration=duration,region_rows=region_rows)
     @bp.get('/inspection/reports/<sid>/data')
     def download(sid):
         service.get(sid);service.check_id(sid)

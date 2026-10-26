@@ -3286,6 +3286,34 @@ function drawScaleBar() {
   ctx.fillText(barM >= 1 ? barM + 'm' : (barM*100) + 'cm', x + barPx/2, y - 8);
 }
 
+// 2026-10-26: 地图上叠加语义区域（客厅/卧室/厨房…），来自 navigation_state.regions
+function drawRegions() {
+  const regions = window.__navRegions;
+  if (!regions || !regions.length) return;
+  ctx.save();
+  for (const r of regions) {
+    const pts = r.points || [];
+    if (pts.length < 3) continue;
+    ctx.beginPath();
+    pts.forEach((p, i) => { const s = w2s(p[0], p[1]); i ? ctx.lineTo(s.x, s.y) : ctx.moveTo(s.x, s.y); });
+    ctx.closePath();
+    ctx.fillStyle = (r.color || '#4f9dff') + '22';
+    ctx.fill();
+    ctx.strokeStyle = (r.color || '#4f9dff') + 'aa';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    let cx = 0, cy = 0;
+    for (const p of pts) { cx += p[0]; cy += p[1]; }
+    cx /= pts.length; cy /= pts.length;
+    const c = w2s(cx, cy);
+    ctx.fillStyle = '#dce8f5';
+    ctx.font = '12px "Segoe UI", "Microsoft YaHei", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(r.name, c.x, c.y);
+  }
+  ctx.restore();
+}
+
 function render(ts) {
   if (controlPage) return;
   frameCount++;
@@ -3304,6 +3332,7 @@ function render(ts) {
   drawGrid();
   drawTrajectory();
   drawMap();
+  drawRegions();
   drawScan();
   drawRobot();
   drawScaleBar();

@@ -52,6 +52,7 @@ class NavigationRuntime:
         self.preview_cache = None
         self.lock = threading.RLock()
         self.patrol_runner = PatrolRunner(self)
+        self._regions_cache = None
         self.mode = 'localization'
         self.autonomy = None
         self.busy = False
@@ -203,6 +204,7 @@ class NavigationRuntime:
                 localized=ready,
                 # 2026-10-25: 静态地图是 latched 只发一次，不能拿 map_age 当就绪判据。
                 map_loaded=bool(self.active_map) and self.lifecycle.get('map_server') == 3,
+                regions=self.map_regions(),
                 localization=dict(pose_ok=bool(self.pose_ok),
                     amcl_age=(now-self.last_amcl) if self.last_amcl else None,
                     cov=self.pose_cov), calibration_error=self.calibration_error(),
@@ -652,6 +654,26 @@ class NavigationRuntime:
                     on_result(None, str(e))
                 else:
                     raise
+
+    def map_regions(self):
+        """当前定位地图的语义区域；按文件 mtime 缓存，payload 每拍调用也不读盘。"""
+        name = self.active_map
+        if not name:
+            return []
+        try:
+            path = self.store.path(name).parent / 'regions.json'
+            mtime = path.stat().st_mtime if path.exists() else 0.
+        except (OSError, ValueError):
+            return []
+        cache = getattr(self, '_regions_cache', None)
+        if cache and cache[0] == name and cache[1] == mtime:
+            return cache[2]
+        try:
+            regions = self.store.regions(name)
+        except (OSError, ValueError):
+            regions = []
+        self._regions_cache = (name, mtime, regions)
+        return regions
 
     def patrol_leg_begin(self, sid):
         # 巡检每段开始：把试航链路摆成「正在导航」的状态，否则 Nav2 的
