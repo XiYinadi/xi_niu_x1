@@ -16,7 +16,7 @@ import tempfile
 import threading
 import time
 
-from flask import jsonify, request, send_file
+from flask import Response, jsonify, request, send_file
 from PIL import Image, ImageDraw
 import yaml
 
@@ -301,6 +301,51 @@ def register_map_editor(app, node_getter, navigation_getter, asset_root=None):
             if hasattr(nav, 'emit'):
                 nav.emit()
             return dict(deleted=name, moved_to=moved, maps=nav.store.list())
+        return handle(run)
+
+    @app.get('/api/map-editor/inventory')
+    def map_editor_inventory(): return handle(lambda: dict(maps=navigation().store.inventory()))
+
+    @app.get('/api/map-editor/thumb')
+    def map_editor_thumb():
+        try:
+            name = checked_name(request.args.get('name', ''))
+            path = navigation().store.path(name)
+            meta = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+            image = Image.open(path.parent / str(meta.get('image', ''))).convert('L')
+            image.thumbnail((240, 180))
+            buf = io.BytesIO(); image.save(buf, format='PNG')
+            return Response(buf.getvalue(), mimetype='image/png',
+                            headers={'Cache-Control': 'no-store'})
+        except (ValueError, OSError, yaml.YAMLError) as error:
+            return jsonify(error=str(error)), 400
+
+    @app.post('/api/map-editor/rename')
+    def map_editor_rename():
+        def run():
+            data = body(); nav = navigation()
+            name = checked_name(data.get('name')); to = checked_name(data.get('to'))
+            if getattr(nav, 'active_map', None) == name:
+                raise ValueError('这张地图正在定位中使用，请先停止定位再重命名')
+            new = nav.store.rename(name, to)
+            moved = []
+            if hasattr(nav, 'patrols'):
+                for row in nav.patrols.list():
+                    if row.get('map') == name:
+                        task = nav.patrols.get(row['name']); task['map'] = new
+                        nav.patrols.save(task); moved.append(row['name'])
+            if hasattr(nav, 'emit'): nav.emit()
+            return dict(renamed=new, tasks=moved, maps=nav.store.list())
+        return handle(run)
+
+    @app.post('/api/map-editor/official')
+    def map_editor_official():
+        def run():
+            data = body(); nav = navigation()
+            name = checked_name(data.get('name'))
+            official = bool(data.get('official', True))
+            value = nav.store.set_official(name, official)
+            return dict(name=name, official=value, maps=nav.store.inventory())
         return handle(run)
 
     return editor

@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import tempfile
+import yaml
 import time
 from pathlib import Path
 
@@ -83,6 +84,62 @@ class MapStore:
         tmp.write_text(json.dumps(dict(map=name, regions=cleaned), ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
         os.replace(tmp, path)
         return cleaned
+
+    def official(self, name):
+        return (self.path(name).parent / '.official').is_file()
+
+    def set_official(self, name, official=True):
+        self.path(name)
+        marker = self.path(name).parent / '.official'
+        if official:
+            marker.write_text('1\n', encoding='utf-8')
+        elif marker.exists():
+            marker.unlink()
+        return self.official(name)
+
+    def rename(self, name, new_name):
+        folder = self.path(name).parent
+        new_name = checked_name(new_name)
+        if new_name == name:
+            return new_name
+        target = self.root / new_name
+        if target.exists():
+            raise ValueError('已有同名地图：' + new_name)
+        shutil.move(str(folder), str(target))
+        return new_name
+
+    def info(self, name):
+        path = self.path(name)
+        try:
+            meta = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+        except (OSError, yaml.YAMLError):
+            meta = {}
+        width = height = None
+        image = path.parent / str(meta.get('image', ''))
+        if image.is_file():
+            try:
+                head = image.read_bytes()[:64].split()
+                width, height = int(head[1]), int(head[2])
+            except (OSError, IndexError, ValueError):
+                pass
+        try:
+            size = sum(f.stat().st_size for f in path.parent.iterdir() if f.is_file())
+            updated = path.stat().st_mtime
+        except OSError:
+            size, updated = 0, 0
+        return dict(name=name, official=self.official(name),
+                    resolution=meta.get('resolution'), origin=meta.get('origin'),
+                    width=width, height=height, size_bytes=size, updated=updated,
+                    regions=len(self.regions(name)))
+
+    def inventory(self):
+        rows = []
+        for name in self.list():
+            try:
+                rows.append(self.info(name))
+            except (OSError, ValueError):
+                continue
+        return rows
 
     def delete(self, name):
         """移到 .trash/，不真删；调用方负责拒绝正在使用的地图。"""

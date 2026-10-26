@@ -133,7 +133,42 @@
    status('已删除地图：'+name+'（移动到 .trash/'+result.moved_to+'）');
   }catch(error){status(error.message,true);}
  });
- el('load-live').addEventListener('click',()=>load('live'));el('load-saved').addEventListener('click',()=>load('saved',el('map-list').value));el('map-list').addEventListener('change',buttons);
+ // 2026-10-26: 地图管理（缩略图 / 重命名 / 正式图）
+ let invCache=null;
+ async function refreshInventory(){
+  try{const r=await api('inventory');invCache=r.maps||[];}catch(_){invCache=null;}
+  updatePreview();
+ }
+ function updatePreview(){
+  const name=el('map-list').value,img=el('map-thumb'),meta=el('map-meta'),btn=el('official-map'),ren=el('rename-map');
+  const row=(invCache||[]).find(m=>m.name===name);
+  if(!name||!row){img.hidden=true;meta.textContent='';btn.textContent='设为正式';btn.disabled=true;ren.disabled=!name;return;}
+  img.src='/api/map-editor/thumb?name='+encodeURIComponent(name);img.hidden=false;
+  const kb=Math.round((row.size_bytes||0)/1024);
+  const res=row.resolution?((row.resolution*100).toFixed(1)+' cm/格'):'—';
+  meta.textContent=(row.width&&row.height?row.width+'×'+row.height+' · ':'')+res+' · '+kb+' KB · '+(row.regions||0)+' 个区域'+(row.official?' · 正式图':'');
+  btn.textContent=row.official?'取消正式':'设为正式';btn.disabled=false;ren.disabled=false;
+ }
+ el('rename-map').addEventListener('click',async()=>{
+  const name=el('map-list').value;
+  if(!name){status('请先选择地图',true);return;}
+  const to=window.prompt('新的地图名（字母/数字/下划线/短横线，1–64 位）',name+'_v2');
+  if(to===null)return;
+  const next=(to||'').trim();
+  if(!/^[A-Za-z0-9_-]{1,64}$/.test(next)){status('名字只能包含字母、数字、下划线或短横线',true);return;}
+  try{const r=await api('rename',{name,to:next});mapOptions(r.maps);el('map-list').value=r.renamed;await refreshInventory();
+   status('已重命名为 '+r.renamed+(r.tasks&&r.tasks.length?'；同步更新任务：'+r.tasks.join('、'):''));}
+  catch(error){status(error.message,true);}
+ });
+ el('official-map').addEventListener('click',async()=>{
+  const name=el('map-list').value;
+  if(!name){status('请先选择地图',true);return;}
+  const row=(invCache||[]).find(m=>m.name===name);
+  const want=!(row&&row.official);
+  try{await api('official',{name,official:want});await refreshInventory();status(want?('已标记为正式图：'+name):('已取消正式标记：'+name));}
+  catch(error){status(error.message,true);}
+ });
+ el('load-live').addEventListener('click',()=>load('live'));el('load-saved').addEventListener('click',()=>load('saved',el('map-list').value));el('map-list').addEventListener('change',()=>{buttons();updatePreview();});
  el('save-regions').addEventListener('click',async()=>{
   if(el('save-regions').disabled)return;
   const name=state.source&&state.source.source;
@@ -148,5 +183,5 @@
   try{const result=await api('save',{token:state.source.token,operations:state.operations,name,request_id:state.saveRequest.id});state.savedRevision=state.revision;mapOptions(result.maps);el('open-saved').href='/map-editor?map='+encodeURIComponent(result.saved);el('open-saved').textContent='打开 '+result.saved+' →';el('open-saved').hidden=false;status('已保存新地图：'+result.saved+'。可在定位或巡检中选择这个版本。');}
   catch(error){status(error.message,true);}finally{state.saving=false;buttons();}
  });
- (async()=>{buttons();resize();try{const result=await api('maps');mapOptions(result.maps);const selected=new URLSearchParams(location.search).get('map');if(selected){el('map-list').value=selected;await load('saved',selected);}else await load('live');}catch(error){status(error.message,true);}})();
+ (async()=>{buttons();resize();try{const result=await api('maps');mapOptions(result.maps);await refreshInventory();const selected=new URLSearchParams(location.search).get('map');if(selected){el('map-list').value=selected;await load('saved',selected);}else await load('live');}catch(error){status(error.message,true);}})();
 })();
