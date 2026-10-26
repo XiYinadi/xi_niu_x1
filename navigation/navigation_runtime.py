@@ -433,9 +433,11 @@ class NavigationRuntime:
                 previous = getattr(self, '_pose_check', None)
                 self._pose_check = (now, self.last_pose['x'], self.last_pose['y'])
                 if previous is not None and (self.navigating or self.patrol_runner.active):
-                    span = max(0.05, now - previous[0])
+                    span = now - previous[0]
                     shift = math.hypot(self.last_pose['x']-previous[1], self.last_pose['y']-previous[2])
-                    if shift/span > 1.0:
+                    # 两拍间隔太短时，几厘米的正常 AMCL 修正会被放大成高速率；
+                    # 必须有足够的时间跨度和足够大的位移才判「跳变」。
+                    if span >= .25 and shift >= .20 and shift/span > 1.2:
                         self.cancel('定位跳变 %.2f 米，导航停止；请重新设置当前位置' % shift, disarm=True)
                         return
             else:

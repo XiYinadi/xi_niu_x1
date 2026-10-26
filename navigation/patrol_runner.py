@@ -27,6 +27,8 @@ class PatrolRunner:
         self.rotate_target = None
         self.rotate_then = None
         self.leg_target = None
+        self._rot_cmd = 0.0
+        self._rot_t = 0.0
         self.rotate_target = None
 
     def camera_ready(self):
@@ -263,6 +265,7 @@ class PatrolRunner:
             step, self.rotate_then = self.rotate_then, None
             if step == 'direct':
                 self.status, self.phase_started = 'direct', now
+                self._rot_cmd = 0.
                 return
             if step == 'arrived':
                 self.status, self.arrived_at = 'dwell', now
@@ -272,9 +275,13 @@ class PatrolRunner:
             return
         if now - self.phase_started > 20:
             raise ValueError('原地旋转超时，巡检停止')
-        # 角度越大转越快，限幅 0.55，避免齿轮/舵机冲击
-        rot = max(-.55, min(.55, error*1.5))
-        self.nav.send_drive(0., 0., self.nav.armed(), rot)
+        # 角度越大转越快，限幅 0.55；再做斜率限制（1.5/s），避免齿轮冲击。
+        target_rot = max(-.55, min(.55, error*1.5))
+        dt = min(.2, max(.0, now-self._rot_t)) if self._rot_t else .05
+        step = 1.5*dt
+        self._rot_cmd = max(self._rot_cmd-step, min(self._rot_cmd+step, target_rot))
+        self._rot_t = now
+        self.nav.send_drive(0., 0., self.nav.armed(), self._rot_cmd)
 
     def _drive_direct(self, now):
         """短腿直行：先对准方位，再低速直行，靠近后对准点位朝向。"""
@@ -304,7 +311,9 @@ class PatrolRunner:
         clearance = getattr(self.nav, 'trial_clearance', None)
         if clearance is not None and clearance < .18:
             raise ValueError('直行前方净空不足，巡检停止')
-        speed = .32 if distance > .35 else .20
+        target_speed = .32 if distance > .35 else .20
+        # 0.6 秒斜坡：别让电机从 0 一步跳到 0.32（起步会窜）。
+        speed = min(target_speed, .55*max(0., now-self.phase_started))
         steer = max(-.6, min(.6, error*1.5))
         self.nav.send_drive(speed, steer, self.nav.armed(), 0.)
         self.message = '直行 %d/%d · 距 %.2f m' % (self.index+1, self.total, distance)
@@ -339,6 +348,7 @@ class PatrolRunner:
                         self.message = '原地旋转对准第 %d/%d 个点位（直行）' % (self.index+1, self.total)
                         return
                     self.status, self.phase_started = 'direct', time.monotonic()
+                    self._rot_cmd = 0.
                     self.message = '直行前往第 %d/%d 个点位' % (self.index+1, self.total)
                     return
                 heading = math.atan2(math.sin(target['yaw']-pose['yaw']), math.cos(target['yaw']-pose['yaw']))
