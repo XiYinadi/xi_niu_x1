@@ -426,6 +426,20 @@ class NavigationRuntime:
                 self.cancel('导航进程已退出，请查看运行日志', disarm=True)
                 self.process = None
                 self.status = 'error'
+            # 2026-10-26: 定位跳变守卫。车最快 0.25 m/s，位姿若以 >1.0 m/s
+            # 的速度变化，只可能是 AMCL 重定位或激光里程计重置；此时继续按
+            # 这个位姿跑就会开到别处（实测跳了 1.4 米）。立刻停车并要求重设位置。
+            if self.last_pose is not None:
+                previous = getattr(self, '_pose_check', None)
+                self._pose_check = (now, self.last_pose['x'], self.last_pose['y'])
+                if previous is not None and (self.navigating or self.patrol_runner.active):
+                    span = max(0.05, now - previous[0])
+                    shift = math.hypot(self.last_pose['x']-previous[1], self.last_pose['y']-previous[2])
+                    if shift/span > 1.0:
+                        self.cancel('定位跳变 %.2f 米，导航停止；请重新设置当前位置' % shift, disarm=True)
+                        return
+            else:
+                self._pose_check = None
             self.patrol_runner.tick()
             if getattr(self,'mode','localization')=='mapping' and self.status=='mapping' and self.localized(now) and all(self.lifecycle.get(k)==3 for k in ('planner_server','controller_server','bt_navigator','velocity_smoother')):
                 self.note='建图与避障服务已就绪；可预览探索目标，完成标定后开始自动建图'
