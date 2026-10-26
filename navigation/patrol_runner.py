@@ -29,6 +29,8 @@ class PatrolRunner:
         self.leg_target = None
         self._rot_cmd = 0.0
         self._rot_t = 0.0
+        self._burst_until = 0.0
+        self._settle_until = 0.0
         self.rotate_target = None
 
     def camera_ready(self):
@@ -263,7 +265,11 @@ class PatrolRunner:
                 self._halt(str(exc))
 
     def _rotate(self, now):
-        """原地旋转对准目标航向；对准后自动进入正常导航。"""
+        """分段原地旋转：转一小段 -> 停 0.35s 等定位更新 -> 再判断。
+
+        连续快速旋转时雷达 7.8Hz + AMCL 跟不上，协方差会持续变大导致定位失效；
+        分段旋转把「转」和「观测」交替开，AMCL 每段之后都能重新收敛。
+        """
         pose = self.nav.last_pose
         if pose is None:
             self.pose_lost = getattr(self, 'pose_lost', None) or now
@@ -276,6 +282,7 @@ class PatrolRunner:
         if abs(error) < .10:
             self.nav.send_drive(0., 0., self.nav.armed(), 0.)
             self.rotate_target = None
+            self._burst_until = self._settle_until = 0.
             step, self.rotate_then = self.rotate_then, None
             if step == 'direct':
                 self.status, self.phase_started = 'direct', now
@@ -287,14 +294,21 @@ class PatrolRunner:
                 return
             self._next(self.epoch)
             return
-        if now - self.phase_started > 20:
+        if now - self.phase_started > 30:
             raise ValueError('原地旋转超时，巡检停止')
-        # 角度越大转越快，限幅 0.55；再做斜率限制（1.5/s），避免齿轮冲击。
-        target_rot = max(-.55, min(.55, error*1.5))
-        dt = min(.2, max(.0, now-self._rot_t)) if self._rot_t else .05
-        step = 1.5*dt
-        self._rot_cmd = max(self._rot_cmd-step, min(self._rot_cmd+step, target_rot))
-        self._rot_t = now
+        # 当前在一个「转」的窗口里：保持速度
+        if now < self._burst_until:
+            self.nav.send_drive(0., 0., self.nav.armed(), self._rot_cmd)
+            return
+        # 当前在「停」的窗口里：发零，等雷达/AMCL 更新
+        if now < self._settle_until:
+            self.nav.send_drive(0., 0., self.nav.armed(), 0.)
+            return
+        # 新一段：按剩余角度决定时长和速度（慢转，0.30 上限）
+        burst = min(.5, max(.2, abs(error)/.5))
+        self._rot_cmd = math.copysign(min(.30, .10 + abs(error)*.6), error)
+        self._burst_until = now + burst
+        self._settle_until = self._burst_until + .35
         self.nav.send_drive(0., 0., self.nav.armed(), self._rot_cmd)
 
     def _drive_direct(self, now):
