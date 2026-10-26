@@ -68,7 +68,16 @@ class PatrolRunner:
                 raise ValueError('操作者心跳超时，巡检停止')
         if not self.nav.armed() or self.nav.owner() != self.sid:
             raise ValueError('电机使能或驾驶权已改变，巡检停止')
-        if not self.nav.localized(now):
+        if self.status in ('rotating', 'direct'):
+            # 原地旋转/直行阶段：允许 AMCL 协方差临时变大，只要求位姿持续可得。
+            if self.nav.last_pose is None:
+                lost = getattr(self, 'pose_lost', None) or now
+                self.pose_lost = lost
+                if now - lost > 1.5:
+                    raise ValueError('定位失效，巡检停止')
+            else:
+                self.pose_lost = None
+        elif not self.nav.localized(now):
             raise ValueError('定位失效，巡检停止')
 
     def start(self, data, sid):
