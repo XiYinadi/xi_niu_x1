@@ -325,6 +325,7 @@ class PwmProc:
         self._l = 0.0
         self._a = 0.0
         self._rot = 0.0
+        self._rot_t = 0.0          # rot 最后更新时间（单调时钟），300ms 不更新即失效
         self._armed = False
         self._last_pkt = 0.0        # 0 = 从没收到过,不是「很久以前」
         self._age_ms = 0.0
@@ -369,10 +370,13 @@ class PwmProc:
                 self._a = max(-1.0, min(1.0, float(m.get('a', 0.0))))
             except (TypeError, ValueError):
                 continue
-            try:
-                self._rot = max(-1.0, min(1.0, float(m.get('rot', 0.0))))
-            except (TypeError, ValueError):
-                self._rot = 0.0
+            # 只在报文**带 rot 字段**时更新；手动驾驶的包不带 rot，不能把旋转清掉。
+            if 'rot' in m:
+                try:
+                    self._rot = max(-1.0, min(1.0, float(m['rot'])))
+                    self._rot_t = time.monotonic()
+                except (TypeError, ValueError):
+                    pass
             self._armed = bool(m.get('armed', False))
             got = True
             # 按**报文**计数 —— 原来 += 1 在循环外,数的是「收到东西的调用次数」,
@@ -409,7 +413,7 @@ class PwmProc:
 
         # 2026-10-26: 原地旋转通道。rot 只由导航/巡检层发送（手动摇杆从不为非零），
         # 所以「打方向但油门为零」在手动驾驶里仍然是「不动」。
-        rot = self._rot if (not stale and self._armed) else 0.0
+        rot = self._rot if (not stale and self._armed and now-self._rot_t < .3) else 0.0
         rotating = abs(rot) > .02
         if rotating:
             # 通道 L 物理上是**右**轮、通道 R 是**左**轮（见 motor_wiring.md）。
