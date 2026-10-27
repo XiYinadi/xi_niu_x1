@@ -31,8 +31,10 @@ class Feedback:
     def step(self, v, w, measured_v, measured_w, dt, diff=False):
         if not all(math.isfinite(x) for x in (v,w,measured_v,measured_w,dt)):
             raise ValueError('non-finite command/feedback')
-        if not 0<=v<=.25 or abs(w)>.40:
-            raise ValueError('diagnostic speed limits: 0..0.08m/s, +/-0.20rad/s')
+        # 2026-10-27: 巡航速度已提到 0.28 m/s，这里的上限必须跟着放（原来 0.25），
+        # 否则任何快于 0.25 的指令都会抛错、巡检直接停。报错文案也同步成真实值。
+        if not 0<=v<=.35 or abs(w)>.60:
+            raise ValueError('diagnostic speed limits: 0..0.35m/s, +/-0.60rad/s')
         if not diff and abs(w)>1e-6:
             raise ValueError('angular test requires explicit temporary differential mode')
         dt=max(0.,min(dt,.04))
