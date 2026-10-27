@@ -750,7 +750,11 @@ class NavigationRuntime:
             if self.running():
                 raise ValueError('定位已启动；请先停止再切换地图')
             if self.armed():
-                raise ValueError('请先解除电机使能，再切换建图或定位模式')
+                # 2026-10-27: 这里原来是直接拒绝。断线重连会保持电机使能（驾驶权
+                # 跨重连恢复），于是用户点「加载定位」只看到一句报错、不知道要先
+                # 解除使能。切换模式本身就该是停机的，直接自动解除更符合预期。
+                self.disarm()
+                self.note = '已自动解除电机使能，正在切换定位模式'
             mapfile = self.store.path(name) if mode=='localization' else ''
             if not Path('/dev/ttyUSB0').exists():
                 raise ValueError('雷达设备 /dev/ttyUSB0 不存在，请重新插拔雷达 USB')
