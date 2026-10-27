@@ -160,7 +160,8 @@ class PatrolRunner:
         if not pose:
             return False
         angle = math.atan2(math.sin(pose['yaw']-target['yaw']), math.cos(pose['yaw']-target['yaw']))
-        return math.hypot(pose['x']-target['x'], pose['y']-target['y']) <= .25 and abs(angle) <= .5
+        # 2026-10-27: 取消原地旋转后，到点朝向由行驶中的舵机修正，容差 0.5 -> 0.9 rad。
+        return math.hypot(pose['x']-target['x'], pose['y']-target['y']) <= .25 and abs(angle) <= .9
 
     def _stationary(self, now):
         with self.nav.node._lock:
@@ -345,11 +346,6 @@ class PatrolRunner:
         distance = math.hypot(target['x']-pose['x'], target['y']-pose['y'])
         if distance < .10:
             self.nav.send_drive(0., 0., self.nav.armed(), 0.)
-            error = math.atan2(math.sin(target['yaw']-pose['yaw']), math.cos(target['yaw']-pose['yaw']))
-            if abs(error) > math.radians(15):
-                self.status, self.rotate_then = 'rotating', 'arrived'
-                self.rotate_target, self.phase_started = target['yaw'], now
-                return
             self.status, self.arrived_at = 'dwell', now
             self.phase_started, self.still_since = now, None
             return
@@ -357,9 +353,9 @@ class PatrolRunner:
             raise ValueError('直行段超时，巡检停止')
         bearing = math.atan2(target['y']-pose['y'], target['x']-pose['x'])
         error = math.atan2(math.sin(bearing-pose['yaw']), math.cos(bearing-pose['yaw']))
-        if abs(error) > math.radians(45):
-            self.status, self.rotate_then = 'rotating', 'direct'
-            self.rotate_target, self.phase_started = bearing, now
+        if abs(error) > math.radians(80):
+            # 偏差太大时先原地停住，下一拍靠舵机慢慢修（不再原地旋转）。
+            self.nav.send_drive(0., 0., self.nav.armed(), 0.)
             return
         clearance = getattr(self.nav, 'trial_clearance', None)
         if clearance is not None and clearance < .18:
@@ -391,24 +387,12 @@ class PatrolRunner:
             pose = self.nav.last_pose
             if pose is not None:
                 distance = math.hypot(target['x']-pose['x'], target['y']-pose['y'])
-                bearing = math.atan2(target['y']-pose['y'], target['x']-pose['x'])
                 if distance <= 2.0:
+                    # 2026-10-27: 取消原地旋转。短腿直接低速直行 + 舵机修正。
                     self.leg_target = dict(target)
-                    heading = math.atan2(math.sin(bearing-pose['yaw']), math.cos(bearing-pose['yaw']))
-                    if abs(heading) > math.radians(12):
-                        self.status, self.rotate_then = 'rotating', 'direct'
-                        self.rotate_target, self.phase_started = bearing, time.monotonic()
-                        self.message = '原地旋转对准第 %d/%d 个点位（直行）' % (self.index+1, self.total)
-                        return
                     self.status, self.phase_started = 'direct', time.monotonic()
                     self._rot_cmd = 0.
                     self.message = '直行前往第 %d/%d 个点位' % (self.index+1, self.total)
-                    return
-                heading = math.atan2(math.sin(target['yaw']-pose['yaw']), math.cos(target['yaw']-pose['yaw']))
-                if abs(heading) > math.radians(30):
-                    self.status, self.message = 'rotating', '原地旋转对准第 %d/%d 个点位' % (self.index+1, self.total)
-                    self.rotate_target = target['yaw']
-                    self.phase_started = time.monotonic()
                     return
             self.leg += 1
             token = (epoch, self.leg)
