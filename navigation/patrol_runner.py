@@ -344,7 +344,13 @@ class PatrolRunner:
             return
         self.pose_lost = None
         distance = math.hypot(target['x']-pose['x'], target['y']-pose['y'])
-        if distance < .10:
+        best = min(getattr(self, '_best_dist', distance), distance)
+        self._best_dist = best
+        # 2026-10-27: 原来只在 0.10 m 内停 —— 定位误差 20~30 cm 时永远停不下来，
+        # 车会直接开过点位。改成 0.20 m 停，并且「最近接近到 0.6 m 以内后又远离
+        # 0.30 m」= 已经冲过头，也停（否则会绕一圈再来一次）。
+        overshoot = best < .60 and distance > best + .30
+        if distance < .20 or overshoot:
             self.nav.send_drive(0., 0., self.nav.armed(), 0.)
             self.status, self.arrived_at = 'dwell', now
             self.phase_started, self.still_since = now, None
