@@ -1323,19 +1323,22 @@ def _on_fire_control(data):
     _fire_publish_state()
 
 
+_stale_packet_log_ts = [0.0]
+
+
 def drive_packet_fresh(data, now):
     """Reject queued browser or local gamepad commands after a transport stall."""
     if 'sent_at' in data:
         try:
             age = time.time()-float(data['sent_at'])
-            return math.isfinite(age) and -0.05 <= age <= 0.20
+            return math.isfinite(age) and -0.05 <= age <= 0.60
         except (TypeError, ValueError):
             return False
     if 'sent_monotonic' not in data:
         return True
     try:
         age = now - float(data['sent_monotonic'])
-        return math.isfinite(age) and -0.05 <= age <= 0.20
+        return math.isfinite(age) and -0.05 <= age <= 0.60
     except (TypeError, ValueError):
         return False
 
@@ -1366,13 +1369,13 @@ def _on_motor_control(data):
                          request.sid)
             return
         if not drive_packet_fresh(data, time.monotonic()):
-            _motor_armed = False
-            _drive_owner = None
-            _send_drive(0.0, 0.0, False)
-            _ros_node.publish_cmd_vel(0.0, 0.0)
-            _ros_node.set_motor_arm(False)
-            _emit_motor_state()
-            log.warning('Expired drive command: motors disarmed')
+            # 2026-10-27: 单包陈旧不再收电机。用户表现是「一拉摇杆就退出」——
+            # 实际是一个包被判定过期就 disarm 了整个会话（polling 包龄 ~175ms，
+            # 原窗口 200ms，抖动一下就踩线）。陈旧包丢弃即可；真正断流由
+            # pwm_proc 的 300ms deadman 立刻把 duty 归零。
+            if time.monotonic()-_stale_packet_log_ts[0] > 5.0:
+                _stale_packet_log_ts[0] = time.monotonic()
+                log.info('Dropped a stale drive packet (motor stays armed)')
             return
         # 摇杆/键盘发来已归一化 -1..1 的速度
         lin = float(data.get("linear", 0.0))
