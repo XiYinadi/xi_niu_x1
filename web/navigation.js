@@ -173,12 +173,12 @@
     stateEl.textContent = '连接已断开，导航不可用';
     for (const id of ['nav-load','nav-save','nav-initial','nav-target','nav-go','nav-stop','patrol-add','patrol-preview','patrol-save','patrol-load','patrol-new']) el(id).disabled = true;
   });
-  const cancelOnLeave = () => { if (state && (state.navigating || state.autonomy?.active)) send('cancel'); };
   setInterval(() => {
     if (state && (state.navigating || state.autonomy?.active) && socket.connected && !document.hidden) send('heartbeat');
   }, 200);
-  window.addEventListener('blur', cancelOnLeave);
-  document.addEventListener('visibilitychange', () => { if (document.hidden) cancelOnLeave(); });
+  // 2026-10-27: 删除 blur / visibilitychange 里主动 cancel。原来点一下别的窗口、
+  // 或标签页切到后台，就会把正在跑的巡检/导航取消（报告里那句「操作者取消导航」
+  // 就是它发的）。操作者真掉线由心跳兜底：巡检 2 秒、导航 0.6 秒。
   // Path is drawn in map coordinates with the same viewport as the map.
   const originalRender = render;
   render = function(ts) {

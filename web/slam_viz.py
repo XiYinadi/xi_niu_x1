@@ -3472,7 +3472,7 @@ canvas.addEventListener('dblclick', () => { fitView(); setFollow(true); });
 socket.once('map', () => { fitView(); setFollow(true); });
 requestAnimationFrame(render);
 </script>
-<script src="/navigation.js?v=20261026-regions3"></script>
+<script src="/navigation.js?v=20261027-noblur"></script>
 <script src="/mapping.js?v=20261023-odom1"></script>
 <script src="/control.js?v=20261026-video4"></script>
 <script src="/autonomy.js?v=20261026-inspection1"></script>
