@@ -2369,7 +2369,10 @@ resize();
 
 // ── SocketIO ────────────────────────────────────────────────────
 const CLIENT_ID = (function(){try{var v=localStorage.getItem('rhinoDriveClient');if(!v){v=Math.random().toString(36).slice(2)+Date.now().toString(36);localStorage.setItem('rhinoDriveClient',v);}return v;}catch(e){return 'anon';}})();
-const socket = io({query:{view:controlPage ? 'control' : mappingPage || missionPage ? 'mapping' : 'console', client: CLIENT_ID}});
+// 2026-10-27: 优先 WebSocket（服务端已装 simple-websocket，握手 101 实测通过），
+// 失败才回退 polling。原来只走 polling，每个包一次 HTTP 往返，驾驶/云台延迟都在 300ms 量级。
+const socket = io({query:{view:controlPage ? 'control' : mappingPage || missionPage ? 'mapping' : 'console', client: CLIENT_ID},
+                   transports:['websocket','polling']});
 // Video must not fill the driver's Engine.IO polling queue. Camera disconnects
 // never release driving ownership: they belong to a separate, non-driver SID.
 const cameraSocket = controlPage ? io({forceNew:true,query:{view:'camera'}}) : socket;
