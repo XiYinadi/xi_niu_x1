@@ -637,9 +637,10 @@ def navigation_control(data):
 
 
 def _navigation_disarm():
-    global _motor_armed, _drive_owner
+    global _motor_armed, _drive_owner, _drive_owner_client
     _motor_armed = False
     _drive_owner = None
+    _drive_owner_client = None
     _send_drive(0.0, 0.0, False)
     _ros_node.set_motor_arm(False)
     _ros_node.publish_cmd_vel(0.0, 0.0)
@@ -1044,7 +1045,9 @@ _motor_armed = False
 # 20Hz,现在已提到 60Hz(见文件末尾的 setInterval),机制不变、只是更密。
 # 规则:只有按下「启用电机」的那个客户端能发速度指令,其余一律丢弃。
 _drive_owner = None
+_drive_owner_client = None
 _drive_owner_note_ts = 0.0
+DISARM_GRACE_S = 6.0
 
 # 云台「操作者」的 sid。**与 _drive_owner 完全独立** —— 不复用它的理由:
 # _drive_owner 只在按「启用电机」时抢占,复用就会把云台重新绑回 armed 门上,
@@ -1202,13 +1205,23 @@ def _on_disconnect():
     # Disconnect must stop hardware before acquiring navigation locks/RPCs.
     # An observer disconnect must leave the actual driver's task untouched.
     if _motor_armed and request.sid == _drive_owner:
-        _motor_armed = False
-        _drive_owner = None
-        _send_drive(0.0, 0.0, False)
-        _ros_node.publish_cmd_vel(0.0, 0.0)
-        _ros_node.set_motor_arm(False)
-        _emit_motor_state()
-        log.warning("Driver disconnected — motors disarmed")
+        # 2026-10-27: 不再立即 disarm —— 页面 socket 会周期性重连（polling），
+        # 每次旧 sid 断开都会把电机收掉。给 6 秒宽限：同一浏览器重连会自动
+        # 把驾驶权还给新 sid；真走了（关页面/断网）才 disarm。
+        lost_sid = request.sid
+        def _late_disarm():
+            global _motor_armed, _drive_owner, _drive_owner_client
+            if _motor_armed and _drive_owner == lost_sid:
+                _motor_armed = False
+                _drive_owner = None
+                _drive_owner_client = None
+                _send_drive(0.0, 0.0, False)
+                _ros_node.publish_cmd_vel(0.0, 0.0)
+                _ros_node.set_motor_arm(False)
+                _emit_motor_state()
+                log.warning('Driver disconnected — motors disarmed (%.0fs grace)', DISARM_GRACE_S)
+        threading.Timer(DISARM_GRACE_S, _late_disarm).start()
+        log.warning('Driver connection lost — %.0fs grace before disarm', DISARM_GRACE_S)
     if navigation_owned:
         try:
             _navigation.cancel('操作者断线，导航已取消', disarm=True)
@@ -1329,7 +1342,7 @@ def drive_packet_fresh(data, now):
 
 @socketio.on("motor_control")
 def _on_motor_control(data):
-    global _motor_armed, _drive_owner, _drive_owner_note_ts, _gimbal_owner, _lat_last_log
+    global _motor_armed, _drive_owner, _drive_owner_client, _drive_owner_note_ts, _gimbal_owner, _lat_last_log
     action = (data or {}).get("action")
     if action == "vel":
         _t0 = time.monotonic()
@@ -1400,6 +1413,7 @@ def _on_motor_control(data):
         # 谁按的「启用电机」谁就是驾驶者;解除时让出控制权
         _motor_armed = bool(data.get("armed", False))
         _drive_owner = request.sid if _motor_armed else None
+        _drive_owner_client = (request.args.get('client') or None) if _motor_armed else None
         _ros_node.set_motor_arm(_motor_armed)
         # 立刻同步给直连通道:解除时这一包就是急停,pwm_proc 不必等 deadman
         _send_drive(0.0, 0.0, _motor_armed)
@@ -1409,6 +1423,7 @@ def _on_motor_control(data):
     elif action == "estop":
         _motor_armed = False
         _drive_owner = None
+        _drive_owner_client = None
         # Hardware stop must precede any Nav2 lock/service cancellation.
         _send_drive(0.0, 0.0, False)
         _ros_node.publish_cmd_vel(0.0, 0.0)
@@ -1585,6 +1600,7 @@ def log_tail_loop():
 
 @socketio.on("connect")
 def _on_connect(auth=None):
+    global _drive_owner
     # 之前这里没有任何日志,连上来用的是 websocket 还是 long-polling 完全看不见
     # —— 而这两者的延迟差一个数量级(polling 每个包都要一次 HTTP 往返)。
     _up = str(request.environ.get("HTTP_UPGRADE", "")).lower()
@@ -1603,6 +1619,12 @@ def _on_connect(auth=None):
     # Push current motor armed state (default disarmed)
     socketio.emit("motor_state",
                   {"armed": _motor_armed, "driver": _drive_owner}, to=request.sid)
+    # 2026-10-27: 同一个浏览器重连 => 把驾驶权还给新 sid，不必重新点「启用电机」
+    _client_id = request.args.get('client')
+    if _motor_armed and _drive_owner_client and _client_id == _drive_owner_client:
+        _drive_owner = request.sid
+        socketio.emit('motor_state', {'armed': _motor_armed, 'driver': _drive_owner}, to=request.sid)
+        log.info('Driver re-attached after reconnect (sid=%s)', request.sid)
     # 建图状态也一样要补发:边缘触发的广播循环只会在**变化时**发,不补这一发,
     # 刷新页面后按钮会一直停在 HTML 里的初始文案,直到下次状态变化才跟上。
     socketio.emit("mapping_state", _map_state_payload(), to=request.sid)
@@ -2343,7 +2365,8 @@ new ResizeObserver(resize).observe(mapBody);
 resize();
 
 // ── SocketIO ────────────────────────────────────────────────────
-const socket = io({query:{view:controlPage ? 'control' : mappingPage || missionPage ? 'mapping' : 'console'}});
+const CLIENT_ID = (function(){try{var v=localStorage.getItem('rhinoDriveClient');if(!v){v=Math.random().toString(36).slice(2)+Date.now().toString(36);localStorage.setItem('rhinoDriveClient',v);}return v;}catch(e){return 'anon';}})();
+const socket = io({query:{view:controlPage ? 'control' : mappingPage || missionPage ? 'mapping' : 'console', client: CLIENT_ID}});
 // Video must not fill the driver's Engine.IO polling queue. Camera disconnects
 // never release driving ownership: they belong to a separate, non-driver SID.
 const cameraSocket = controlPage ? io({forceNew:true,query:{view:'camera'}}) : socket;
