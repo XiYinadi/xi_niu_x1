@@ -287,6 +287,8 @@ class PatrolRunner:
             self._rot_error0 = error
             self._rot_done = 0.
             self._gyro_t = now
+            self._rot_cmd = 0.
+            self._rot_t = now
         else:
             rate = self.nav.gyro_z()
             if rate is not None:
@@ -315,9 +317,14 @@ class PatrolRunner:
         if now - self.phase_started > 30:
             raise ValueError('原地旋转超时，巡检停止')
         # 连续慢转：0.12~0.22 占空比，剩余角度越小越慢
-        # 2026-10-27 实测：占空比 0.12 时前轮横向刮擦太大，只有约 1°/s（几乎卡住）；
-        # 0.22 时约 6.4°/s。所以原地旋转必须给到 0.18~0.22 才转得动。
-        speed = min(.22, max(.18, abs(remaining)*.9))
+        # 2026-10-27 实测：0.12 -> 1°/s（卡住）；0.22 -> 6.4°/s；0.30 -> 9.6°/s。
+        # 用户要求更快，取 0.28~0.30；仍用 2.0/s 斜率限制，避免起始冲击。
+        target_speed = min(.30, max(.28, abs(remaining)*1.2))
+        dt = min(.2, max(.0, now-self._rot_t)) if self._rot_t else .05
+        slew = 2.0*dt
+        self._rot_cmd = max(self._rot_cmd-slew, min(self._rot_cmd+slew, target_speed))
+        self._rot_t = now
+        speed = self._rot_cmd
         self._rot_cmd = math.copysign(speed, remaining)
         self.nav.send_drive(0., 0., self.nav.armed(), self._rot_cmd)
 
