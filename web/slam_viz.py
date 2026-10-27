@@ -1381,8 +1381,12 @@ def _on_motor_control(data):
         lin = float(data.get("linear", 0.0))
         ang = float(data.get("angular", 0.0))
         if _navigation is not None and (_navigation.navigating or _automatic_active()):
-            if abs(lin) < 0.001 and abs(ang) < 0.001 and not data.get('takeover'):
-                return  # Idle manual heartbeats must not overwrite autonomous commands.
+            if abs(lin) < 0.001 and abs(ang) < 0.001:
+                # 2026-10-27: 零速包**一律**不算手动接管 —— 页面按下摇杆的瞬间会发
+                # 一包 takeover=true + 0/0，原来那一下就 cancel 了正在跑的巡检
+                # （日志：lin=0.000 ang=0.000 takeover=True → 手动接管）。
+                # 真正的接管必须带速度。
+                return
             log.warning('Manual takeover: sid=%s owner=%s lin=%.3f ang=%.3f takeover=%s',
                         request.sid, _drive_owner, lin, ang, bool(data.get('takeover')))
             _navigation.cancel('手动接管，导航已取消')
