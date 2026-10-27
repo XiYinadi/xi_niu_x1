@@ -22,6 +22,7 @@ def build():
                 robot_model_type='nav2_amcl::DifferentialMotionModel',
                 scan_topic='/scan', set_initial_pose=False,
                 update_min_d=0.02, update_min_a=0.03, transform_tolerance=0.5,
+                max_beams=35, laser_max_range=8.0,
                 recovery_alpha_slow=0.001, recovery_alpha_fast=0.1)
     # DifferentialMotionModel models odometry noise, not drive commands.
     # Reference changes must move the footprint as well as the laser TF.

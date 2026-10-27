@@ -315,7 +315,7 @@ class PatrolRunner:
         if now - self.phase_started > 30:
             raise ValueError('原地旋转超时，巡检停止')
         # 连续慢转：0.12~0.22 占空比，剩余角度越小越慢
-        speed = min(.22, max(.10, abs(remaining)*.9))
+        speed = min(.16, max(.08, abs(remaining)*.9))
         self._rot_cmd = math.copysign(speed, remaining)
         self.nav.send_drive(0., 0., self.nav.armed(), self._rot_cmd)
 
