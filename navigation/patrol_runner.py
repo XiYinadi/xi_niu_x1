@@ -315,7 +315,9 @@ class PatrolRunner:
         if now - self.phase_started > 30:
             raise ValueError('原地旋转超时，巡检停止')
         # 连续慢转：0.12~0.22 占空比，剩余角度越小越慢
-        speed = min(.16, max(.08, abs(remaining)*.9))
+        # 2026-10-27 实测：占空比 0.12 时前轮横向刮擦太大，只有约 1°/s（几乎卡住）；
+        # 0.22 时约 6.4°/s。所以原地旋转必须给到 0.18~0.22 才转得动。
+        speed = min(.22, max(.18, abs(remaining)*.9))
         self._rot_cmd = math.copysign(speed, remaining)
         self.nav.send_drive(0., 0., self.nav.armed(), self._rot_cmd)
 
