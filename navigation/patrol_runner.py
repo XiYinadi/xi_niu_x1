@@ -349,18 +349,21 @@ class PatrolRunner:
             self.status, self.arrived_at = 'dwell', now
             self.phase_started, self.still_since = now, None
             return
-        if now - self.phase_started > 30:
-            raise ValueError('直行段超时，巡检停止')
+        if now - self.phase_started > 60:
+            raise ValueError('直行段超时（60 秒未到点），巡检停止')
+        # 2026-10-27: 取消原地旋转后，「航向差 >80° 就停住」会让车永远不动。
+        # 大偏差改成低速 + 大舵角直接转过去（舵机能让车边走边转）。
+        if distance < getattr(self, '_best_dist', 1e9) - .05:
+            self._best_dist, self._best_t = distance, now
+        elif now - getattr(self, '_best_t', now) > 12:
+            raise ValueError('直行卡住：距点位 %.2f 米没有前进，巡检停止' % distance)
         bearing = math.atan2(target['y']-pose['y'], target['x']-pose['x'])
         error = math.atan2(math.sin(bearing-pose['yaw']), math.cos(bearing-pose['yaw']))
-        if abs(error) > math.radians(80):
-            # 偏差太大时先原地停住，下一拍靠舵机慢慢修（不再原地旋转）。
-            self.nav.send_drive(0., 0., self.nav.armed(), 0.)
-            return
         clearance = getattr(self.nav, 'trial_clearance', None)
         if clearance is not None and clearance < .18:
             raise ValueError('直行前方净空不足，巡检停止')
-        target_speed = .32 if distance > .35 else .20
+        big = abs(error) > math.radians(60)
+        target_speed = (.18 if big else .32) if distance > .35 else .20
         # 0.6 秒斜坡：别让电机从 0 一步跳到 0.32（起步会窜）。
         speed = min(target_speed, .55*max(0., now-self.phase_started))
         steer = max(-.6, min(.6, error*1.5))
@@ -392,6 +395,7 @@ class PatrolRunner:
                     self.leg_target = dict(target)
                     self.status, self.phase_started = 'direct', time.monotonic()
                     self._rot_cmd = 0.
+                    self._best_dist, self._best_t = distance, time.monotonic()
                     self.message = '直行前往第 %d/%d 个点位' % (self.index+1, self.total)
                     return
             self.leg += 1
