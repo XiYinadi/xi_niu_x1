@@ -31,7 +31,7 @@ def main():
     target = math.radians(args.angle)
     if abs(args.angle) > 360:
         raise SystemExit("角度必须在 ±360 度以内")
-    if not 0.05 <= args.rate <= 0.35:
+    if not 0.05 <= args.rate <= 0.50:
         raise SystemExit("占空比必须在 0.05~0.35")
 
     rclpy.init()

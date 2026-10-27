@@ -319,9 +319,10 @@ class PatrolRunner:
         # 连续慢转：0.12~0.22 占空比，剩余角度越小越慢
         # 2026-10-27 实测：0.12 -> 1°/s（卡住）；0.22 -> 6.4°/s；0.30 -> 9.6°/s。
         # 用户要求更快，取 0.28~0.30；仍用 2.0/s 斜率限制，避免起始冲击。
-        target_speed = min(.30, max(.28, abs(remaining)*1.2))
+        # 2026-10-27 实测：0.30 -> 9.6°/s，0.40 -> 18°/s（90° 用 5.0 秒）。用户要求更快。
+        target_speed = min(.40, max(.36, abs(remaining)*1.6))
         dt = min(.2, max(.0, now-self._rot_t)) if self._rot_t else .05
-        slew = 2.0*dt
+        slew = 2.6*dt
         self._rot_cmd = max(self._rot_cmd-slew, min(self._rot_cmd+slew, target_speed))
         self._rot_t = now
         speed = self._rot_cmd
