@@ -24,6 +24,17 @@
 MD_RE='^[^ ]*python3 .*motor_driver\.py'
 PWM_RE='^[^ ]*python3 .*pwm_proc\.py'
 
+# ⚠️⚠️ 参数文件唯一来源 = robot/motor/motor_params.yaml。
+#    ~/motor_params.yaml 必须是**软链接**；一旦它被替换成普通文件（旧副本），
+#    pwm_proc 读到的就是旧值 —— 改 flip_*/swap_lr 怎么重启都不生效。
+#    2026-10-28 实测踩过一次（左轮方向排查被这个拖了很久）。
+PARAMS_LINK="$HOME/motor_params.yaml"
+PARAMS_REAL="$HOME/robot/motor/motor_params.yaml"
+if [ ! -L "$PARAMS_LINK" ] || [ "$(readlink -f "$PARAMS_LINK")" != "$(readlink -f "$PARAMS_REAL")" ]; then
+  echo "!! $PARAMS_LINK 不是指向 $PARAMS_REAL 的软链接（会被当成旧副本），已自动修复"
+  ln -sfn "$PARAMS_REAL" "$PARAMS_LINK"
+fi
+
 # ⚠️⚠️ 预检必须在**动 motor_driver 之前**。
 #    否则坏状态(无权开 gpiochip)下会先杀掉好的那个、再起不来新的 ⇒
 #    留下「电机没驱动、车还能滑」的空窗,而且下面的报错只会说

@@ -19,6 +19,7 @@ motor_driver:
     # 2026-09-15 实测:两轮一起翻才修好「整体镜像」(前进→后退 + 右转→左转)。
     # 注意单独交换左右通道只会反转「转向」、不影响前后 —— 那修不好镜像。
     flip_left: false
+
     flip_right: true
     # 左右通道交叉:true = 通道 L 的 H 桥实际接的是**右**轮。只反转「转向」,
     # 前进/后退不受影响(和 flip_* 正相反,见 motor_control.map_channels)。

@@ -27,6 +27,43 @@
 
 ---
 
+## 零、参数文件与方向验证（2026-10-28 实测）
+
+### ⚠️ 参数文件的唯一来源
+
+`~/motor_params.yaml` **必须是指向** `~/robot/motor/motor_params.yaml` **的软链接**。
+pwm_proc 启动时读的是前者；一旦软链接被替换成普通文件（旧副本），改
+`flip_*` / `swap_lr` **怎么重启都不生效**，表现就是「方向怎么改都反」。
+2026-10-28 就在这上面排查了很久。`start_pwm.sh` 现在会在启动前自动检查和修复。
+
+自检：
+```bash
+ls -l ~/motor_params.yaml            # 应显示 -> /home/aidlux/robot/motor/motor_params.yaml
+md5sum ~/motor_params.yaml ~/robot/motor/motor_params.yaml   # 两行必须一致
+```
+
+### 方向配置（编码器实测确认）
+
+| 项 | 值 |
+|---|---|
+| `flip_left` | false |
+| `flip_right` | true |
+| `swap_lr` | true |
+
+验证方法（pwm_proc 不申请编码器线，可直接读）：把车**架空**，跑
+`PYTHONPATH=$PWD/motor python3 /tmp/enc_dir_test.py`，正确时：
+
+- 前进：左轮计数为负、右轮计数为正（两轮在车体两侧，符号本应相反）
+- 倒车：左右符号各自翻转
+
+若两轮符号**相同**，说明左右某一侧方向位反了，改对应的 `flip_*`。
+
+⚠️ 地面测试会叠加打滑，不能只凭「车往一边拐」判断方向：架空前进左轮
+约 1.1 万计数、右轮约 0.9 万（差 10%）；落地后左轮只有右轮的约 1/3，
+那是抓地问题，不是方向问题。
+
+---
+
 ## 一、信号线：L298N → 犀牛派
 
 | L298N 端子 | 犀牛派 PIN | GPIO | gpiochip0 line | 建议线色 | 说明 |
