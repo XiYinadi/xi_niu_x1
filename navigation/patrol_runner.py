@@ -241,10 +241,13 @@ class PatrolRunner:
                     if now-self.phase_started > required+25:
                         raise ValueError('到点后未能持续停稳，停止巡检')
                     if quiet and now-self.still_since >= required:
+                        basis = ('direct_leg_pose_and_fresh_odometry'
+                                 if getattr(self, 'leg_mode', 'nav2') == 'direct'
+                                 else 'nav2_success_and_pose_and_fresh_odometry')
                         self.record_id = self.inspections.record(self.inspection_id, automatic=True,
                             context=dict(arrived_at=self.arrived_at, settled_at=time.time(),
                                          stationary_s=now-self.still_since,
-                                         arrival_basis='nav2_success_and_pose_and_fresh_odometry'))
+                                         arrival_basis=basis))
                         self.status, self.message = 'detecting', '已停稳，正在拍照检测并保存记录'
                         self.phase_started = now
                 elif self.status == 'detecting':
@@ -268,6 +271,18 @@ class PatrolRunner:
                     self._next(self.epoch)
             except Exception as exc:
                 self._halt(str(exc))
+
+    def _stale_sensors(self, now):
+        """短段直行也要有和 Nav2 段同等的传感器新鲜度约束。"""
+        cfg, node = self.nav.config, self.nav.node
+        with node._lock:
+            scan_t = node._last_scan_t
+            odom_t = getattr(node, '_last_odom_t', 0)
+            imu_t = getattr(node, '_last_imu_t', 0)
+        limits = (('雷达', scan_t, cfg['scan_timeout_s']),
+                  ('里程计', odom_t, cfg.get('odom_timeout_s', 1.0)),
+                  ('GY-521', imu_t, cfg.get('imu_timeout_s', .75)))
+        return [name for name, t, limit in limits if not t or now - t > limit]
 
     def _rotate(self, now):
         """原地旋转：用陀螺仪积分做角度闭环（100Hz），不再等 7.8Hz 雷达。
@@ -344,30 +359,49 @@ class PatrolRunner:
             return
         self.pose_lost = None
         distance = math.hypot(target['x']-pose['x'], target['y']-pose['y'])
-        best = min(getattr(self, '_best_dist', distance), distance)
-        self._best_dist = best
+        best = getattr(self, '_best_dist', distance)
+        # 2026-10-28: 先判「本拍有推进」再更新最佳距离。原顺序先更新后比较，
+        # 条件恒不成立，段计时超过 12 秒就必定误报「没有前进」。
+        if distance < best - .05:
+            self._best_dist, self._best_t = distance, now
+            best = distance
         # 2026-10-27: 原来只在 0.10 m 内停 —— 定位误差 20~30 cm 时永远停不下来，
         # 车会直接开过点位。改成 0.20 m 停，并且「最近接近到 0.6 m 以内后又远离
         # 0.30 m」= 已经冲过头，也停（否则会绕一圈再来一次）。
         overshoot = best < .60 and distance > best + .30
         if distance < .20 or overshoot:
             self.nav.send_drive(0., 0., self.nav.armed(), 0.)
-            self.status, self.arrived_at = 'dwell', now
+            self.status, self.arrived_at = 'dwell', time.time()
             self.phase_started, self.still_since = now, None
             return
         if now - self.phase_started > 60:
             raise ValueError('直行段超时（60 秒未到点），巡检停止')
+        if now - getattr(self, '_best_t', now) > 12:
+            raise ValueError('直行卡住：距点位 %.2f 米没有前进，巡检停止' % distance)
+        stale = self._stale_sensors(now)
+        if stale:
+            self.nav.send_drive(0., 0., self.nav.armed(), 0.)
+            self.stale_since = getattr(self, 'stale_since', None) or now
+            if now - self.stale_since > 1.0:
+                raise ValueError('直行中传感器数据过期（%s），巡检停止' % '、'.join(stale))
+            return
+        self.stale_since = None
         # 2026-10-27: 取消原地旋转后，「航向差 >80° 就停住」会让车永远不动。
         # 大偏差改成低速 + 大舵角直接转过去（舵机能让车边走边转）。
-        if distance < getattr(self, '_best_dist', 1e9) - .05:
-            self._best_dist, self._best_t = distance, now
-        elif now - getattr(self, '_best_t', now) > 12:
-            raise ValueError('直行卡住：距点位 %.2f 米没有前进，巡检停止' % distance)
         bearing = math.atan2(target['y']-pose['y'], target['x']-pose['x'])
         error = math.atan2(math.sin(bearing-pose['yaw']), math.cos(bearing-pose['yaw']))
         clearance = getattr(self.nav, 'trial_clearance', None)
-        if clearance is not None and clearance < .18:
-            raise ValueError('直行前方净空不足，巡检停止')
+        limit = self.nav.config.get('trial_clearance_m', .20)
+        if clearance is None:
+            # 2026-10-28: 净空未知时不能继续给油门（原来 None 直接放行）。
+            self.nav.send_drive(0., 0., self.nav.armed(), 0.)
+            self.no_clearance = getattr(self, 'no_clearance', None) or now
+            if now - self.no_clearance > 3.0:
+                raise ValueError('直行净空未知（扫描未更新），巡检停止')
+            return
+        self.no_clearance = None
+        if clearance < limit:
+            raise ValueError('直行前方净空 %.2f 米不足 %.2f 米，巡检停止' % (clearance, limit))
         big = abs(error) > math.radians(60)
         target_speed = (.18 if big else .32) if distance > .35 else .20
         # 0.6 秒斜坡：别让电机从 0 一步跳到 0.32（起步会窜）。
@@ -399,12 +433,14 @@ class PatrolRunner:
                 if distance <= 2.0:
                     # 2026-10-27: 取消原地旋转。短腿直接低速直行 + 舵机修正。
                     self.leg_target = dict(target)
+                    self.leg_mode = 'direct'
                     self.status, self.phase_started = 'direct', time.monotonic()
                     self._rot_cmd = 0.
                     self._best_dist, self._best_t = distance, time.monotonic()
                     self.message = '直行前往第 %d/%d 个点位' % (self.index+1, self.total)
                     return
             self.leg += 1
+            self.leg_mode = 'nav2'
             token = (epoch, self.leg)
             self.status = 'navigating'
             self.message = '第 %d/%d 轮 · 前往第 %d/%d 个点位' % (self.cycle+1, self.cycles, self.index+1, self.total)

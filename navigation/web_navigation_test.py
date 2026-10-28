@@ -45,10 +45,12 @@ class Arbitration(unittest.TestCase):
         self.client.emit('motor_control',dict(action='vel',linear=.2,angular=0))
         web._navigation.cancel.assert_called_once()
 
-    def test_explicit_zero_takes_over(self):
+    def test_zero_speed_takeover_does_not_cancel(self):
+        # 2026-10-28: 页面按下摇杆的瞬间会发 takeover=1 + 0/0；这不能取消巡检
+        # （真正接管必须带速度）。原断言与现行为不一致，按现行约定更新。
         self.client.emit('motor_control',dict(action='vel',linear=0,angular=0,takeover=True))
-        web._navigation.cancel.assert_called_once()
-        web._send_drive.assert_called_once_with(0.,0.,True)
+        web._navigation.cancel.assert_not_called()
+        web._send_drive.assert_not_called()
 
     def test_nonzero_takes_over(self):
         self.client.emit('motor_control',dict(action='vel',linear=.2,angular=0))

@@ -443,19 +443,24 @@ class NavigationRuntime:
             # 的速度变化，只可能是 AMCL 重定位或激光里程计重置；此时继续按
             # 这个位姿跑就会开到别处（实测跳了 1.4 米）。立刻停车并要求重设位置。
             if self.last_pose is not None:
-                previous = getattr(self, '_pose_check', None)
-                self._pose_check = (now, self.last_pose['x'], self.last_pose['y'])
-                if previous is not None and (self.navigating or self.patrol_runner.active):
-                    span = now - previous[0]
-                    shift = math.hypot(self.last_pose['x']-previous[1], self.last_pose['y']-previous[2])
-                    # 两拍间隔太短时，几厘米的正常 AMCL 修正会被放大成高速率；
-                    # 必须有足够的时间跨度和足够大的位移才判「跳变」。
-                    if span >= .25 and shift >= .20 and shift/span > 1.2:
-                        self.cancel('定位跳变 %.2f 米，导航停止；请重新设置当前位置' % shift, disarm=True)
-                        return
+                reference = getattr(self, '_pose_check', None)
+                # 2026-10-28: 参考样本至少保留 0.25 秒再更新。原来每拍都覆盖参考、
+                # 判据又要求与参考间隔 >=0.25s —— 正常 20Hz 循环下永远不成立，
+                # 实测 1.4 米的跳变完全不会触发。
+                if reference is None or now - reference[0] >= .25:
+                    _patrol = getattr(self, 'patrol_runner', None)
+                    if reference is not None and (self.navigating or (_patrol is not None and _patrol.active)):
+                        span = now - reference[0]
+                        shift = math.hypot(self.last_pose['x']-reference[1], self.last_pose['y']-reference[2])
+                        if span >= .25 and shift >= .20 and shift/span > 1.2:
+                            self.cancel('定位跳变 %.2f 米，导航停止；请重新设置当前位置' % shift, disarm=True)
+                            return
+                    self._pose_check = (now, self.last_pose['x'], self.last_pose['y'])
             else:
                 self._pose_check = None
-            self.patrol_runner.tick()
+            _patrol_runner = getattr(self, 'patrol_runner', None)
+            if _patrol_runner is not None:
+                _patrol_runner.tick()
             if getattr(self,'mode','localization')=='mapping' and self.status=='mapping' and self.localized(now) and all(self.lifecycle.get(k)==3 for k in ('planner_server','controller_server','bt_navigator','velocity_smoother')):
                 self.note='建图与避障服务已就绪；可预览探索目标，完成标定后开始自动建图'
             if not self.navigating:
@@ -486,11 +491,18 @@ class NavigationRuntime:
                 self.send_drive(0.0, 0.0, self.armed())
                 if is_trial(self.config):self.last_control_t=now
                 return
-            # 2026-10-26: 巡检用的是自己的 action client 和看门狗；运行时这套
-            # 单目标看门狗（心跳 0.6s / 指令超时）在 VLM 推理期间必然误判，
-            # 会把巡检在第 1 点检测完时掐掉。巡检 active 时让这里失效。
-            if getattr(self, 'patrol_runner', None) is not None and self.patrol_runner.active:
-                reason = None
+            # 2026-10-28: 巡检只豁免它自己负责的那部分，**不能整段清空 reason**。
+            #  - 心跳：巡检 _guard 自己管（检测/出报告阶段跳过）；
+            #  - 指令超时：只有 Nav2 在开车（navigating）时才有意义，停稳/直行段
+            #    由巡检每拍自己发指令、last_command 不更新，拿它判死会误停；
+            #  - 传感器 / 定位 / 使能：一律保留（真正的安全网）。
+            patrol = getattr(self, 'patrol_runner', None)
+            if patrol is not None and patrol.active:
+                status = getattr(patrol, 'status', '')
+                if reason == '操作者链路超时，导航停止':
+                    reason = None
+                elif reason == '导航速度指令超时，导航停止' and status != 'navigating':
+                    reason = None
             if reason:
                 self.cancel(reason, disarm=True)
                 return
@@ -520,7 +532,11 @@ class NavigationRuntime:
                     if self.trial_no_motion and now-self.trial_no_motion>1.5:raise ValueError('车辆没有正常移动，试航停止')
                 else:
                     l, a = twist_to_joystick(*self.command, self.config); rot = 0.0
-                self.send_drive(l, a, self.armed(), rot)
+                # 只有原地旋转才带第 4 个参数，普通前进保持三参数调用（兼容既有调用方/测试）
+                if rot:
+                    self.send_drive(l, a, self.armed(), rot)
+                else:
+                    self.send_drive(l, a, self.armed())
             except ValueError as e:
                 self.cancel(str(e), disarm=True)
 
