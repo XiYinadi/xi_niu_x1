@@ -52,11 +52,16 @@ class MPU6050:
             raise OSError('Incomplete I2C write')
 
     def configure(self):
-        # PLL clock, all axes awake; 44Hz DLPF, 100Hz output, +/-250dps, +/-2g.
-        for reg, value in ((0x6B, 1), (0x6C, 0), (0x1A, 3), (0x19, 9), (0x1B, 0), (0x1C, 0)):
+        # PLL clock, all axes awake; 21Hz DLPF, 100Hz output, +/-250dps, +/-2g.
+        # 2026-10-28: DLPF 44Hz->21Hz。实测这类 MPU6050 在 44Hz 下逐样本噪声
+        # std 达 0.02~0.07 rad/s，21Hz 明显更稳；代价是约 20ms 延迟，
+        # 对 100Hz 里程计与 0.8rad/s 的旋转足够。
+        for reg, value in ((0x6B, 1), (0x6C, 0), (0x1A, 4), (0x19, 9), (0x1B, 0), (0x1C, 0)):
             self.write(reg, value)
-        time.sleep(.15)
-        for reg, value in ((0x6B, 1), (0x6C, 0), (0x1A, 3), (0x19, 9), (0x1B, 0), (0x1C, 0)):
+        # 2026-10-28: 0.15 -> 0.5s。DLPF 刚配置完的前几百毫秒噪声偏大，
+        # 若立刻采样，首次标定会误报 Sensor moving（重试才过）。
+        time.sleep(.5)
+        for reg, value in ((0x6B, 1), (0x6C, 0), (0x1A, 4), (0x19, 9), (0x1B, 0), (0x1C, 0)):
             if self.read(reg, 1)[0] != value:
                 raise ValueError(f'Configuration readback failed at {reg:#x}')
 

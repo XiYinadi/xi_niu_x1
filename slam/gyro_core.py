@@ -14,7 +14,11 @@ def calibrate(samples):
     gravity = accel.mean(axis=0)
     if not 8.0 < np.linalg.norm(gravity) < 11.5:
         raise ValueError('Gravity out of range; check sensor installation')
-    if np.max(accel.std(axis=0)) > .25 or np.max(gyro.std(axis=0)) > .012 or np.linalg.norm(gyro.mean(axis=0)) > .10:
+    # 2026-10-28: 原阈值 std<=0.012 rad/s(0.7°/s)、|mean|<=0.10 rad/s 是按理想器件定的，
+    # 实测常见 MPU6050 模块静止噪声就有 0.02~0.07 rad/s ⇒ 静止也永远报 moving。
+    # 放宽到 std<=0.05(≈2.9°/s)、|mean|<=0.20：偏置会被标定掉，不需要小；
+    # 真实手推/自转远大于 3°/s，不会把运动误判成静止。
+    if np.max(accel.std(axis=0)) > .25 or np.max(gyro.std(axis=0)) > .05 or np.linalg.norm(gyro.mean(axis=0)) > .20:
         raise ValueError('Sensor moving during calibration; keep chassis stationary')
     return gyro.mean(axis=0), gravity / np.linalg.norm(gravity)
 
