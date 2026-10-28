@@ -27,14 +27,16 @@ localization_timeout_s: 3.0
 # Keep calibrated=false: the 95cm/100.1cm error and dynamic turning remain open.
 # Only supervised SINGLE goals are enabled by this separate bounded profile.
 navigation_mode: supervised_trial
+# Operator requested 10m single goals; still supervised and uncalibrated.
+supervised_profile: range_10m
 trial_pwm_cap: 0.45
 # 原地旋转：rot 归一化对应的角速度（rad/s）；纯旋转请求按 w/rotation_w 映射
 rotation_w: 0.8   # 2026-10-26 配合 0.28 m/s 提速
 trial_max_steering_rad: 0.4363323129985824
 trial_max_joystick: 0.85
-trial_max_duration_s: 180.0
-trial_max_goal_m: 5.0   # 2026-10-25 临时解除距离限制（标定前）
-trial_max_travel_m: 6.0
-trial_max_path_m: 6.0
+trial_max_duration_s: 300.0
+trial_max_goal_m: 10.0
+trial_max_travel_m: 15.0  # Maximum displacement from this leg's odometry origin.
+trial_max_path_m: 15.0
 trial_clearance_m: 0.20
 trial_evidence: "Forward feedback controller used in 6.5cm and 95cm physical runs at <=10% PWM; both +/-0.5 stationary steering points measured about15deg. Interpolation and turning dynamics are provisional; no full-throttle assumption."

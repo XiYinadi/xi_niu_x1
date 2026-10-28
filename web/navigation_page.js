@@ -33,6 +33,10 @@
  el('mission-calibration').open=false;
  el('mission-measurements').textContent='正在读取实测标定配置…';
  function age(key){const value=feed?.[key];return socket.connected&&Number.isFinite(value)?value+(performance.now()-feedAt)/1000:Infinity;}
+ function supervisedGuidance(limits){
+  if(!limits || !['goal_m','path_m','duration_s','speed_mps','pwm_cap'].every(k=>Number.isFinite(limits[k])))return '正在读取监督导航范围；准备完成后先预览路径，再启用电机开始。';
+  return `监督导航：目标距当前位置不超过 ${limits.goal_m} 米，单段规划路径不超过 ${limits.path_m} 米，每段最多 ${limits.duration_s} 秒。速度上限 ${limits.speed_mps} m/s，油门上限 ${Math.round(limits.pwm_cap*100)}%。先预览，再启用电机并开始；到点、近障碍、离开页面或断线会停用。当前仍未完成实车标定。`;
+ }
  function paint(){
   const connected=socket.connected,trial=nav?.drive_mode==='supervised_trial';
   const calibrated=trial ? ('drive_error' in (nav||{})&&!nav.drive_error) : !!calibration?.calibrated&&!nav?.calibration_error;
@@ -42,14 +46,14 @@
     ['定位',!!nav?.localized,nav?.localized?'位置已收敛':'需加载地图并确认当前位置'],
     ['路径规划',!!nav?.planner_ready,nav?.planner_ready?'服务已就绪':'尚未准备'],
     ['导航与避障',!!nav?.navigator_ready,nav?.navigator_ready?'服务已就绪':'尚未准备'],
-    [trial?'低速试航控制':'实测转角与车速',calibrated,calibrated?(trial?'速度反馈 · 限油门10%':'配置已校验'):'控制配置尚未就绪'],
+    [trial?'监督导航控制':'实测转角与车速',calibrated,calibrated?(trial?(Number.isFinite(nav?.supervised_limits?.pwm_cap)?`速度反馈 · 油门上限 ${Math.round(nav.supervised_limits.pwm_cap*100)}%`:'速度反馈 · 等待范围信息'):'配置已校验'):'控制配置尚未就绪'],
     ['当前页面驾驶权',driver,driver?'当前页面持有':'尚未启用电机']];
   const list=el('mission-checks');list.replaceChildren();
   for(const [name,ok,note] of checks){const li=document.createElement('li'),dot=document.createElement('i'),span=document.createElement('span'),small=document.createElement('small');dot.className=connected&&ok?'live':'';span.textContent=name;small.textContent=connected?note:'连接已断开';li.append(dot,span,small);list.append(li);}
   const ready=connected&&checks.every(c=>c[1])&&!nav?.busy&&!nav?.navigating;
   el('mission-ready').textContent=!connected?'未连接':nav?.navigating?'正在导航':!calibrated?'可定位 · 待标定':ready?(trial?'可以低速试航':'可以导航'):'待准备';
   el('mission-ready').className='status-pill '+(ready||nav?.navigating?'live':'warning');
-  el('mission-run-note').textContent=trial?'低速试航：选1米内目标并预览路径，启用电机后点开始导航。限速0.05m/s、每次最多45秒；到点、近障碍、离开页面或断线会停用。距离约5%的偏差仍待精调。':!calibrated?'定位和路径预览可以使用。自动行驶需先实测转角、车速并核对安装位置；当前保持锁定。':'现场有人监督，确认路线和车头方向后启用电机，再点开始导航。切换页面或断线会停止任务。';
+  el('mission-run-note').textContent=trial?supervisedGuidance(nav?.supervised_limits):!calibrated?'定位和路径预览可以使用。自动行驶需先实测转角、车速并核对安装位置；当前保持锁定。':'现场有人监督，确认路线和车头方向后启用电机，再点开始导航。切换页面或断线会停止任务。';
   el('btn-arm').disabled=!connected||(!armed&&(!calibrated||!nav?.localized||!sensors||!!nav?.busy));
   if(!ready)el('nav-go').disabled=true;
   if(!connected){for(const id of ['nav-load','nav-initial','nav-stop','nav-target','nav-cancel'])el(id).disabled=true;}

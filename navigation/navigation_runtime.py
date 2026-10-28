@@ -209,6 +209,10 @@ class NavigationRuntime:
                     amcl_age=(now-self.last_amcl) if self.last_amcl else None,
                     cov=self.pose_cov), calibration_error=self.calibration_error(),
                 drive_error=self.drive_error(),drive_mode='supervised_trial' if is_trial(self.config) else 'calibrated',
+                supervised_limits=(dict(profile=self.config.get('supervised_profile','short'),
+                    goal_m=self.config['trial_max_goal_m'],path_m=self.config['trial_max_path_m'],
+                    duration_s=self.config['trial_max_duration_s'],speed_mps=self.config['max_speed_mps'],
+                    pwm_cap=self.config['trial_pwm_cap']) if is_trial(self.config) else None),
                 preview_valid=bool(getattr(self,'preview_cache',None)),
                 trial_clearance_m=getattr(self,'trial_clearance',None),
                 goal_distance_m=math.hypot(self.goal['x']-self.last_pose['x'],self.goal['y']-self.last_pose['y']) if self.goal and self.last_pose else None,
@@ -594,8 +598,9 @@ class NavigationRuntime:
                     if any(abs(cache['goal'][k]-float(data.get(k,0)))>1e-6 for k in ('x','y','yaw')):
                         raise ValueError('目标已改变，请重新预览')
                     if math.hypot(data['x']-self.last_pose['x'],data['y']-self.last_pose['y'])>self.config['trial_max_goal_m']:
-                        raise ValueError('低速试航请先选择1米以内的目标')
-                    if cache['length']>self.config['trial_max_path_m']:raise ValueError('试航路径过长，请选近处目标并保持车头方向')
+                        raise ValueError('目标距离超过当前监督导航上限 %.1f 米，请选择更近目标或分段巡检' % self.config['trial_max_goal_m'])
+                    if cache['length']>self.config['trial_max_path_m']:
+                        raise ValueError('规划路径 %.1f 米，超过当前单段上限 %.1f 米，请调整目标或分段巡检' % (cache['length'],self.config['trial_max_path_m']))
                     if math.hypot(cache['start']['x']-self.last_pose['x'],cache['start']['y']-self.last_pose['y'])>.10:
                         raise ValueError('机器人已移动，请重新预览')
                     if abs(math.atan2(math.sin(cache['start']['yaw']-self.last_pose['yaw']),math.cos(cache['start']['yaw']-self.last_pose['yaw'])))>math.radians(15):

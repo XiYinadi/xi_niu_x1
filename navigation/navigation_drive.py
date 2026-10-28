@@ -14,13 +14,21 @@ def validate_navigation(config):
     # (0.12/20%/20°/0.7)。calibrated 仍为 false，这组数没有实车标定背书。
     # 2026-10-25: 标定前临时解除距离/角度限制（1m/1.2m/45s/20° -> 5m/6m/180s/25°）。
     # 传感器 0.4s 上限、净空 0.2m、速度 0.12m/s、PWM 20% 仍然生效。
+    # Extended range is a selected supervised profile, not measured calibration.
+    # It does not raise speed, duty, steering or sensor freshness limits.
+    profile=config.get('supervised_profile','short')
+    if profile not in ('short','range_10m'):
+        raise ValueError('未知监督导航配置：'+str(profile))
     limits={'max_speed_mps':.28,'trial_pwm_cap':.45,'trial_max_steering_rad':math.radians(25),
         'trial_max_joystick':.85,'trial_max_duration_s':180.,'trial_max_goal_m':5.,
         'trial_max_travel_m':6.,'trial_max_path_m':6.}
+    if profile=='range_10m':
+        limits.update(trial_max_goal_m=10.,trial_max_travel_m=15.,
+                      trial_max_path_m=15.,trial_max_duration_s=300.)
     for key,maximum in limits.items():
         value=config.get(key)
         if type(value) not in (float,int) or not math.isfinite(value) or not 0<value<=maximum+1e-9:
-            raise ValueError('低速试航参数超出已验证范围：'+key)
+            raise ValueError('监督导航参数超出所选配置上限：'+key)
     for key in ('wheelbase_m','command_timeout_s','scan_timeout_s','odom_timeout_s','imu_timeout_s'):
         value=config.get(key)
         if type(value) not in (float,int) or not math.isfinite(value) or value<=0:

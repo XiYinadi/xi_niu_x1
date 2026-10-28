@@ -50,7 +50,9 @@ def build():
     planner = data['planner_server']['ros__parameters']
     planner['planner_plugins'] = ['GridBased']
     planner['GridBased'] = dict(plugin='nav2_smac_planner/SmacPlannerHybrid',
-        tolerance=0.15, downsample_costmap=False, allow_unknown=False,
+        # 2026-10-27: 改回 true —— 关掉之后 zou_lang 这种有大片未知区的图直接
+        # 规划失败（status=6，预览报「第 1 段不可达」）。绕圈问题已经由短腿直行解决。
+        tolerance=0.15, downsample_costmap=False, allow_unknown=True,
         max_iterations=200000, max_planning_time=5.0, motion_model_for_search='DUBIN',
         angle_quantization_bins=72, minimum_turning_radius=radius,
         analytic_expansion_ratio=3.5, analytic_expansion_max_length=max(3.0, 4*radius))
